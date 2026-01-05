@@ -89,9 +89,7 @@ func (c *Context) GetString(key string) string {
 func (c *Context) Next() {
 	c.index++
 	for c.index < len(c.middlewares) {
-		if c.middlewares[c.index] != nil {
-			c.middlewares[c.index].Handle(c)
-		}
+		c.middlewares[c.index].Handle(c)
 		c.index++
 	}
 }

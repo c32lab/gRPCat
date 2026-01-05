@@ -3,9 +3,11 @@ package proxy
 
 import (
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 // ConnectionCache maintains a pool of reusable gRPC connections to backend servers.
@@ -46,6 +48,11 @@ func (c *ConnectionCache) Get(backend string) (*grpc.ClientConn, error) {
 	conn, err := grpc.Dial(backend,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second,
+			Timeout:             30 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 	if err != nil {
 		return nil, err

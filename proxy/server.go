@@ -74,6 +74,9 @@ func (s *Server) GetGRPCServer() *grpc.Server {
 }
 
 func (s *Server) Use(mw middleware.Middleware) {
+	if mw == nil {
+		panic("middleware cannot be nil")
+	}
 	s.middlewares = append(s.middlewares, mw)
 }
 
