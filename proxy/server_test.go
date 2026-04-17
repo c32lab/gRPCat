@@ -65,7 +65,7 @@ func TestServer_StopClosesBackendConnections(t *testing.T) {
 	}
 	go srv.grpcServer.Serve(lis)
 
-	conn, err := grpc.Dial(lis.Addr().String(),
+	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)
@@ -172,7 +172,7 @@ func TestServer_ConcurrentUse(t *testing.T) {
 	go srv.grpcServer.Serve(lis)
 	defer srv.Stop()
 
-	cc, err := grpc.Dial(lis.Addr().String(),
+	cc, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)

@@ -22,7 +22,7 @@ func TestForwarder_UnaryRPC(t *testing.T) {
 	proxyAddr := startProxyServer(t, backendAddr)
 
 	// Create client connection to proxy
-	conn, err := grpc.Dial(proxyAddr,
+	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)
@@ -59,7 +59,7 @@ func TestForwarder_ServerStreaming(t *testing.T) {
 	proxyAddr := startProxyServer(t, backendAddr)
 
 	// Create client connection to proxy
-	conn, err := grpc.Dial(proxyAddr,
+	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)
@@ -116,7 +116,7 @@ func TestForwarder_MetadataForwarding(t *testing.T) {
 	proxyAddr := startProxyServer(t, backendAddr)
 
 	// Create client connection to proxy
-	conn, err := grpc.Dial(proxyAddr,
+	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)
@@ -316,7 +316,7 @@ func TestForwarder_BackendStatusPropagation(t *testing.T) {
 	backendAddr := startStatusBackend(t, codes.PermissionDenied, "nope")
 	proxyAddr := startProxyServer(t, backendAddr)
 
-	conn, err := grpc.Dial(proxyAddr,
+	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)
@@ -384,7 +384,7 @@ func TestForwarder_ClientStreaming(t *testing.T) {
 	backendAddr := startClientStreamingBackend(t)
 	proxyAddr := startProxyServer(t, backendAddr)
 
-	conn, err := grpc.Dial(proxyAddr,
+	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)
@@ -435,7 +435,7 @@ func TestForwarder_BidiStreaming(t *testing.T) {
 	backendAddr := startBidiEchoBackend(t)
 	proxyAddr := startProxyServer(t, backendAddr)
 
-	conn, err := grpc.Dial(proxyAddr,
+	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
 	)

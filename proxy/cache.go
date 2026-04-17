@@ -57,7 +57,7 @@ func (c *ConnectionCache) Get(backend string) (*grpc.ClientConn, error) {
 		opts = append(opts, grpc.WithKeepaliveParams(*c.keepalive))
 	}
 
-	conn, err := grpc.Dial(backend, opts...)
+	conn, err := grpc.NewClient(backend, opts...)
 	if err != nil {
 		return nil, err
 	}
