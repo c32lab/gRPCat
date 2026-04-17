@@ -15,9 +15,18 @@ const (
 
 // RequestInfo contains information about the incoming gRPC request
 type RequestInfo struct {
-	Service      string
-	Method       string
-	Metadata     metadata.MD
+	Service  string
+	Method   string
+	Metadata metadata.MD
+	// FirstPayload is the decoded protobuf payload of the FIRST client
+	// message on the stream. It is populated for routing/inspection by
+	// middlewares before forwarding begins. Semantics by RPC type:
+	//   - Unary: the full request body.
+	//   - Server-streaming: the single client request.
+	//   - Client-streaming / Bidirectional: only the first client message.
+	//     Subsequent messages are not buffered here; middleware cannot
+	//     inspect them without additional machinery.
+	// May be nil if the payload could not be parsed as a gRPC message.
 	FirstPayload []byte
 }
 
@@ -85,7 +94,16 @@ func (c *Context) GetString(key string) string {
 	return ""
 }
 
-// Next executes the next middleware in the chain
+// Next executes the next middleware in the chain.
+//
+// Semantics: Next() advances the chain index and loops through all
+// remaining middlewares (matching gin's behavior). A middleware that
+// does NOT call Next() is therefore equivalent to one that does — the
+// rest of the chain still runs after this middleware returns. The only
+// way to stop the chain is Abort() / AbortWithError() / SendResponse().
+//
+// Calling Next() explicitly is useful when a middleware wants to run
+// logic after downstream middlewares complete (pre/post pattern).
 func (c *Context) Next() {
 	c.index++
 	for c.index < len(c.middlewares) {

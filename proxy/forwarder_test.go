@@ -376,3 +376,200 @@ func startStatusBackend(t *testing.T, code codes.Code, msg string) string {
 	t.Cleanup(func() { srv.Stop() })
 	return lis.Addr().String()
 }
+
+// TestForwarder_ClientStreaming: client sends N frames, backend replies
+// once with the count. Exercises the c2s goroutine finishing after
+// multiple frames before backend responds.
+func TestForwarder_ClientStreaming(t *testing.T) {
+	backendAddr := startClientStreamingBackend(t)
+	proxyAddr := startProxyServer(t, backendAddr)
+
+	conn, err := grpc.Dial(proxyAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := conn.NewStream(ctx,
+		&grpc.StreamDesc{ClientStreams: true},
+		"/test.Echo/ClientStream",
+	)
+	if err != nil {
+		t.Fatalf("new stream: %v", err)
+	}
+
+	const n = 4
+	for i := 0; i < n; i++ {
+		if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte("x"))}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("close send: %v", err)
+	}
+
+	resp := &Frame{}
+	if err := stream.RecvMsg(resp); err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	got := string(extractPayload(resp.data))
+	if got != "4" {
+		t.Errorf("expected count=4, got %q", got)
+	}
+
+	// Trailer / EOF.
+	if err := stream.RecvMsg(&Frame{}); err != io.EOF {
+		t.Errorf("expected EOF after single response, got %v", err)
+	}
+}
+
+// TestForwarder_BidiStreaming: client and backend exchange messages
+// concurrently. Exercises c2s and s2c pumping in parallel.
+func TestForwarder_BidiStreaming(t *testing.T) {
+	backendAddr := startBidiEchoBackend(t)
+	proxyAddr := startProxyServer(t, backendAddr)
+
+	conn, err := grpc.Dial(proxyAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := conn.NewStream(ctx,
+		&grpc.StreamDesc{ClientStreams: true, ServerStreams: true},
+		"/test.Echo/Bidi",
+	)
+	if err != nil {
+		t.Fatalf("new stream: %v", err)
+	}
+
+	const n = 3
+	want := []string{"a", "bb", "ccc"}
+	for _, msg := range want {
+		if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte(msg))}); err != nil {
+			t.Fatalf("send %q: %v", msg, err)
+		}
+		resp := &Frame{}
+		if err := stream.RecvMsg(resp); err != nil {
+			t.Fatalf("recv for %q: %v", msg, err)
+		}
+		got := string(extractPayload(resp.data))
+		if got != msg {
+			t.Errorf("echo mismatch: sent %q got %q", msg, got)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("close send: %v", err)
+	}
+	if err := stream.RecvMsg(&Frame{}); err != io.EOF {
+		t.Errorf("expected EOF after %d echoes, got %v", n, err)
+	}
+}
+
+func startClientStreamingBackend(t *testing.T) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv.RegisterService(&grpc.ServiceDesc{
+		ServiceName: "test.Echo",
+		HandlerType: (*any)(nil),
+		Streams: []grpc.StreamDesc{
+			{
+				StreamName:    "ClientStream",
+				ClientStreams: true,
+				Handler: func(_ any, stream grpc.ServerStream) error {
+					count := 0
+					for {
+						if err := stream.RecvMsg(&Frame{}); err != nil {
+							if err == io.EOF {
+								break
+							}
+							return err
+						}
+						count++
+					}
+					return stream.SendMsg(&Frame{data: buildGRPCMessage([]byte(itoa(count)))})
+				},
+			},
+		},
+	}, nil)
+	go srv.Serve(lis)
+	t.Cleanup(func() { srv.Stop() })
+	return lis.Addr().String()
+}
+
+func startBidiEchoBackend(t *testing.T) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv.RegisterService(&grpc.ServiceDesc{
+		ServiceName: "test.Echo",
+		HandlerType: (*any)(nil),
+		Streams: []grpc.StreamDesc{
+			{
+				StreamName:    "Bidi",
+				ClientStreams: true,
+				ServerStreams: true,
+				Handler: func(_ any, stream grpc.ServerStream) error {
+					for {
+						in := &Frame{}
+						if err := stream.RecvMsg(in); err != nil {
+							if err == io.EOF {
+								return nil
+							}
+							return err
+						}
+						payload := extractPayload(in.data)
+						out := &Frame{data: buildGRPCMessage(payload)}
+						if err := stream.SendMsg(out); err != nil {
+							return err
+						}
+					}
+				},
+			},
+		},
+	}, nil)
+	go srv.Serve(lis)
+	t.Cleanup(func() { srv.Stop() })
+	return lis.Addr().String()
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
+}
