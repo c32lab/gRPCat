@@ -92,6 +92,9 @@ func (s *Server) Stop() {
 	})
 }
 
+// GetGRPCServer exposes the underlying *grpc.Server so library users can
+// register additional services (health, reflection, their own handlers)
+// alongside the proxy on the same listener.
 func (s *Server) GetGRPCServer() *grpc.Server {
 	return s.grpcServer
 }

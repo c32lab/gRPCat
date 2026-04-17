@@ -4,6 +4,16 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## Project context
+
+**This repo is a reusable Go pkg (`github.com/c32lab/gRPCat`), not an application.** Its exported identifiers — types, functions, methods, fields — are the contract consumed by downstream modules. Treat the API surface accordingly:
+
+- **"No in-repo caller" is not sufficient reason to delete an exported symbol.** External modules can call it; you cannot see them.
+- Before removing exported API, ask: is there a plausible library-user scenario? (dynamic backend eviction, attaching extra gRPC services, middleware content inspection, etc.) If yes, keep it.
+- The "Simplicity First" rule below applies to *internal* code and to *new* code. It does not override stability of already-published exported API.
+- Unexported or clearly-internal helpers (test-only types, private functions) can be pruned freely.
+- If a breaking change to exported API is genuinely needed, say so explicitly and get approval before deleting.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**

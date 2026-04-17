@@ -14,11 +14,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// echoServer implements a simple echo service for testing
-type echoServer struct {
-	grpc.ServerStream
-}
-
 func TestForwarder_UnaryRPC(t *testing.T) {
 	// Start backend server
 	backendAddr := startEchoBackend(t)
