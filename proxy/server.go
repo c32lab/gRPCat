@@ -11,20 +11,30 @@ import (
 	"github.com/c32lab/gRPCat/parser"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
 type Config struct {
 	DefaultBackend string
+	// KeepaliveParams, if set, controls client-side keepalive for backend
+	// connections. Leave nil to use gRPC defaults — setting an aggressive
+	// Time (e.g. 10s) can violate a backend's EnforcementPolicy.MinTime
+	// (vtctld defaults to 5m) and trigger GOAWAY ENHANCE_YOUR_CALM.
+	KeepaliveParams *keepalive.ClientParameters
 }
 
 type Server struct {
 	config      *Config
+	mu          sync.RWMutex
 	middlewares []middleware.Middleware
 	grpcServer  *grpc.Server
 	contextPool sync.Pool
 	forwarder   *Forwarder
+
+	stopOnce sync.Once
+	stopped  chan struct{}
 }
 
 func NewServer(config *Config) (*Server, error) {
@@ -35,7 +45,8 @@ func NewServer(config *Config) (*Server, error) {
 	server := &Server{
 		config:      config,
 		middlewares: []middleware.Middleware{},
-		forwarder:   NewForwarder(),
+		forwarder:   NewForwarder(config.KeepaliveParams),
+		stopped:     make(chan struct{}),
 	}
 
 	// Initialize context pool for reusing middleware contexts
@@ -57,16 +68,28 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 
+	// Watch for ctx cancel OR an explicit Stop. Either triggers graceful
+	// shutdown; the goroutine exits on whichever fires first so Stop() alone
+	// doesn't leave this goroutine parked on ctx.Done().
 	go func() {
-		<-ctx.Done()
-		s.grpcServer.GracefulStop()
+		select {
+		case <-ctx.Done():
+			s.Stop()
+		case <-s.stopped:
+		}
 	}()
 
 	return s.grpcServer.Serve(listener)
 }
 
 func (s *Server) Stop() {
-	s.grpcServer.GracefulStop()
+	s.stopOnce.Do(func() {
+		close(s.stopped)
+		s.grpcServer.GracefulStop()
+		// Release pooled backend connections. GracefulStop has returned, so
+		// no forwarder is still writing to the cache.
+		s.forwarder.Close()
+	})
 }
 
 func (s *Server) GetGRPCServer() *grpc.Server {
@@ -77,13 +100,24 @@ func (s *Server) Use(mw middleware.Middleware) {
 	if mw == nil {
 		panic("middleware cannot be nil")
 	}
+	s.mu.Lock()
 	s.middlewares = append(s.middlewares, mw)
+	s.mu.Unlock()
+}
+
+// snapshotMiddlewares returns a stable view of the middleware slice. The
+// returned slice is safe to hand to a middleware.Context even if Use is
+// called concurrently, because we never mutate an already-published slice.
+func (s *Server) snapshotMiddlewares() []middleware.Middleware {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.middlewares
 }
 
 // acquireContext gets a context from the pool and initializes it
 func (s *Server) acquireContext(req *middleware.RequestInfo) *middleware.Context {
 	ctx := s.contextPool.Get().(*middleware.Context)
-	ctx.Init(req, s.middlewares)
+	ctx.Init(req, s.snapshotMiddlewares())
 	return ctx
 }
 
@@ -118,6 +152,16 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 		// Read first message frame
 		firstFrame := &Frame{}
 		firstFrameErr := serverStream.RecvMsg(firstFrame)
+
+		// gRPC's codec path (ProxyCodec.Unmarshal) hands us the transport's
+		// internal buffer; it is only valid until the next RecvMsg. We keep
+		// this frame alive past middleware execution and pass it through to
+		// Forward, so copy it up front. See proxy/codec.go:73.
+		if firstFrameErr == nil && len(firstFrame.data) > 0 {
+			buf := make([]byte, len(firstFrame.data))
+			copy(buf, firstFrame.data)
+			firstFrame.data = buf
+		}
 
 		// Try to parse the first frame's payload for middleware inspection
 		var firstPayload []byte

@@ -8,6 +8,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -28,9 +29,10 @@ type Forwarder struct {
 }
 
 // NewForwarder creates a new Forwarder with an empty connection cache.
-func NewForwarder() *Forwarder {
+// ka is optional; when nil, gRPC default keepalive behavior is used.
+func NewForwarder(ka *keepalive.ClientParameters) *Forwarder {
 	return &Forwarder{
-		cache: NewConnectionCache(),
+		cache: NewConnectionCache(ka),
 	}
 }
 
@@ -127,15 +129,19 @@ func (f *Forwarder) Forward(
 					closedSend = true
 				}
 			} else {
-				// Error receiving from backend (connection lost, read error, etc).
-				// Cancel backend stream to free resources and return error immediately.
+				// Error from backend stream. gRPC returns a status.Error here,
+				// carrying the backend's real code/message/details. Forward it
+				// verbatim plus the backend's trailers so the client sees the
+				// exact failure the backend produced.
 				clientCancel()
-				return status.Errorf(codes.Internal, "failed proxying s2c: %v", s2cErr)
+				serverStream.SetTrailer(clientStream.Trailer())
+				return s2cErr
 			}
 		case c2sErr := <-c2sErrChan:
 			if c2sErr != io.EOF {
-				// Client encountered an error while sending.
-				// Cancel backend stream and propagate the error immediately.
+				// Error reading from client (disconnect, cancellation). Cancel
+				// the backend stream and return the client's error as-is so
+				// its status code (typically Canceled) is preserved.
 				clientCancel()
 				return c2sErr
 			}

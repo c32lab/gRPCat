@@ -3,7 +3,6 @@ package proxy
 
 import (
 	"sync"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -13,14 +12,19 @@ import (
 // ConnectionCache maintains a pool of reusable gRPC connections to backend servers.
 // It's safe for concurrent use by multiple goroutines.
 type ConnectionCache struct {
-	mu    sync.RWMutex
-	conns map[string]*grpc.ClientConn
+	mu        sync.RWMutex
+	conns     map[string]*grpc.ClientConn
+	keepalive *keepalive.ClientParameters
 }
 
 // NewConnectionCache creates an empty connection cache.
-func NewConnectionCache() *ConnectionCache {
+// If ka is nil, no client keepalive parameters are applied (gRPC defaults are used).
+// Setting overly aggressive Time (e.g. 10s) may exceed the backend's
+// EnforcementPolicy.MinTime and cause GOAWAY with ENHANCE_YOUR_CALM.
+func NewConnectionCache(ka *keepalive.ClientParameters) *ConnectionCache {
 	return &ConnectionCache{
-		conns: make(map[string]*grpc.ClientConn),
+		conns:     make(map[string]*grpc.ClientConn),
+		keepalive: ka,
 	}
 }
 
@@ -45,15 +49,15 @@ func (c *ConnectionCache) Get(backend string) (*grpc.ClientConn, error) {
 		return conn, nil
 	}
 
-	conn, err := grpc.Dial(backend,
+	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             30 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	)
+	}
+	if c.keepalive != nil {
+		opts = append(opts, grpc.WithKeepaliveParams(*c.keepalive))
+	}
+
+	conn, err := grpc.Dial(backend, opts...)
 	if err != nil {
 		return nil, err
 	}

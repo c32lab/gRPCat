@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // echoServer implements a simple echo service for testing
@@ -310,4 +312,72 @@ func extractPayload(data []byte) []byte {
 		return nil
 	}
 	return data[5:]
+}
+
+// TestForwarder_BackendStatusPropagation verifies that when the backend
+// returns a non-OK status, the proxy preserves its code/message instead of
+// collapsing to codes.Internal.
+func TestForwarder_BackendStatusPropagation(t *testing.T) {
+	backendAddr := startStatusBackend(t, codes.PermissionDenied, "nope")
+	proxyAddr := startProxyServer(t, backendAddr)
+
+	conn, err := grpc.Dial(proxyAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = conn.Invoke(ctx, "/test.Echo/Echo",
+		&Frame{data: buildGRPCMessage([]byte("x"))},
+		&Frame{},
+	)
+	if err == nil {
+		t.Fatalf("expected error from backend, got nil")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected status error, got %T: %v", err, err)
+	}
+	if st.Code() != codes.PermissionDenied {
+		t.Errorf("code: want %v got %v (msg=%q)", codes.PermissionDenied, st.Code(), st.Message())
+	}
+	if st.Message() != "nope" {
+		t.Errorf("message: want %q got %q", "nope", st.Message())
+	}
+}
+
+// startStatusBackend starts a backend that fails every request with the
+// given status code and message.
+func startStatusBackend(t *testing.T, code codes.Code, msg string) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv.RegisterService(&grpc.ServiceDesc{
+		ServiceName: "test.Echo",
+		HandlerType: (*any)(nil),
+		Methods: []grpc.MethodDesc{
+			{
+				MethodName: "Echo",
+				Handler: func(_ any, _ context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+					frame := &Frame{}
+					if err := dec(frame); err != nil {
+						return nil, err
+					}
+					return nil, status.Error(code, msg)
+				},
+			},
+		},
+	}, nil)
+	go srv.Serve(lis)
+	t.Cleanup(func() { srv.Stop() })
+	return lis.Addr().String()
 }
