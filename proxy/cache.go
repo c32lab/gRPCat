@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
@@ -12,19 +13,23 @@ import (
 // ConnectionCache maintains a pool of reusable gRPC connections to backend servers.
 // It's safe for concurrent use by multiple goroutines.
 type ConnectionCache struct {
-	mu        sync.RWMutex
-	conns     map[string]*grpc.ClientConn
-	keepalive *keepalive.ClientParameters
+	mu             sync.RWMutex
+	conns          map[string]*grpc.ClientConn
+	keepalive      *keepalive.ClientParameters
+	transportCreds credentials.TransportCredentials
+	dialOpts       []grpc.DialOption
 }
 
 // NewConnectionCache creates an empty connection cache.
-// If ka is nil, no client keepalive parameters are applied (gRPC defaults are used).
-// Setting overly aggressive Time (e.g. 10s) may exceed the backend's
-// EnforcementPolicy.MinTime and cause GOAWAY with ENHANCE_YOUR_CALM.
-func NewConnectionCache(ka *keepalive.ClientParameters) *ConnectionCache {
+// If ka is nil, no client keepalive parameters are applied (gRPC defaults).
+// If creds is nil, insecure credentials are used. dialOpts are appended
+// after credentials and keepalive (interceptors, stats handlers, etc.).
+func NewConnectionCache(ka *keepalive.ClientParameters, creds credentials.TransportCredentials, dialOpts []grpc.DialOption) *ConnectionCache {
 	return &ConnectionCache{
-		conns:     make(map[string]*grpc.ClientConn),
-		keepalive: ka,
+		conns:          make(map[string]*grpc.ClientConn),
+		keepalive:      ka,
+		transportCreds: creds,
+		dialOpts:       dialOpts,
 	}
 }
 
@@ -50,12 +55,17 @@ func (c *ConnectionCache) Get(backend string) (*grpc.ClientConn, error) {
 	}
 
 	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	}
+	if c.transportCreds != nil {
+		opts = append(opts, grpc.WithTransportCredentials(c.transportCreds))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 	if c.keepalive != nil {
 		opts = append(opts, grpc.WithKeepaliveParams(*c.keepalive))
 	}
+	opts = append(opts, c.dialOpts...)
 
 	conn, err := grpc.NewClient(backend, opts...)
 	if err != nil {

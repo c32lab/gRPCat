@@ -156,6 +156,39 @@ func TestServer_KeepaliveConfigWired(t *testing.T) {
 	}
 }
 
+// TestServer_BackendDialOptionsWired verifies Config.BackendTransportCreds
+// and Config.BackendDialOptions reach the connection cache.
+func TestServer_BackendDialOptionsWired(t *testing.T) {
+	creds := insecure.NewCredentials()
+	customOpt := grpc.WithAuthority("custom")
+	srv, err := NewServer(&Config{
+		DefaultBackend:        "127.0.0.1:1",
+		BackendTransportCreds: creds,
+		BackendDialOptions:    []grpc.DialOption{customOpt},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if srv.forwarder.cache.transportCreds != creds {
+		t.Error("transportCreds not wired")
+	}
+	if len(srv.forwarder.cache.dialOpts) != 1 {
+		t.Errorf("expected 1 dial option, got %d", len(srv.forwarder.cache.dialOpts))
+	}
+
+	// Default: nil creds → insecure fallback, no extra dial options.
+	srv2, err := NewServer(&Config{DefaultBackend: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if srv2.forwarder.cache.transportCreds != nil {
+		t.Errorf("expected nil transportCreds by default, got %+v", srv2.forwarder.cache.transportCreds)
+	}
+	if len(srv2.forwarder.cache.dialOpts) != 0 {
+		t.Errorf("expected 0 dial options by default, got %d", len(srv2.forwarder.cache.dialOpts))
+	}
+}
+
 // TestServer_ConcurrentUse guards against races between Use() and request
 // handling. Run with -race.
 func TestServer_ConcurrentUse(t *testing.T) {

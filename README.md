@@ -66,27 +66,43 @@ func main() {
 }
 ```
 
+### Config Options
+
+```go
+proxy.Config{
+    DefaultBackend:        "localhost:50051",
+    KeepaliveParams:       &keepalive.ClientParameters{Time: 5 * time.Minute},
+    BackendTransportCreds: credentials.NewTLS(tlsConfig), // nil = insecure
+    BackendDialOptions:    []grpc.DialOption{grpc.WithStatsHandler(h)},
+}
+```
+
+- `KeepaliveParams` - Client keepalive for backend connections (nil = gRPC defaults)
+- `BackendTransportCreds` - Transport credentials for backends (nil = insecure)
+- `BackendDialOptions` - Additional dial options (stream interceptors, stats handlers, etc.; unary interceptors have no effect because all RPCs are proxied as streams)
+
 ## Writing Middleware
 
 ```go
 type LoggingMiddleware struct{}
 
 func (m *LoggingMiddleware) Handle(ctx *middleware.Context) {
-    log.Printf("[%s] %s/%s",
-        ctx.Request.Service,
-        ctx.Request.Method)
-
-    ctx.Next() // Continue to next middleware
+    log.Printf("[%s] %s.%s", time.Now().Format(time.RFC3339),
+        ctx.Request.Service, ctx.Request.Method)
+    ctx.Next()
 }
 ```
 
 ### Middleware Capabilities
 
-- `ctx.Next()` - Continue to next middleware
+- `ctx.Next()` - Continue to next middleware (gin-style: chain runs regardless, useful for pre/post pattern)
 - `ctx.Abort()` - Stop execution
+- `ctx.AbortWithError(code, msg)` - Stop and return gRPC error to client
+- `ctx.SendResponse(data)` - Stop and return custom response data
 - `ctx.SetBackend(addr)` - Route to specific backend
+- `ctx.AddMetadata(key, value)` - Add metadata to backend request
 - `ctx.Set/Get(key, value)` - Share data between middlewares
-- `ctx.Request` - Access service, method, metadata, payload
+- `ctx.Request` - Access service, method, metadata, first payload
 
 **See `cmd/grpcat/middlewares/` for complete examples.**
 

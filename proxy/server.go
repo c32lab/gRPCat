@@ -11,6 +11,7 @@ import (
 	"github.com/c32lab/gRPCat/parser"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -23,6 +24,15 @@ type Config struct {
 	// Time (e.g. 10s) can violate a backend's EnforcementPolicy.MinTime
 	// (vtctld defaults to 5m) and trigger GOAWAY ENHANCE_YOUR_CALM.
 	KeepaliveParams *keepalive.ClientParameters
+	// BackendTransportCreds sets the transport credentials for backend
+	// connections. When nil, insecure credentials are used.
+	BackendTransportCreds credentials.TransportCredentials
+	// BackendDialOptions supplies additional grpc.DialOption values
+	// (stream interceptors, stats handlers, etc.) for backend connections.
+	// These are appended after credentials and keepalive options.
+	// Note: unary interceptors have no effect because all RPCs are
+	// proxied as bidirectional streams via grpc.NewClientStream.
+	BackendDialOptions []grpc.DialOption
 }
 
 type Server struct {
@@ -45,7 +55,7 @@ func NewServer(config *Config) (*Server, error) {
 	server := &Server{
 		config:      config,
 		middlewares: []middleware.Middleware{},
-		forwarder:   NewForwarder(config.KeepaliveParams),
+		forwarder:   NewForwarder(config.KeepaliveParams, config.BackendTransportCreds, config.BackendDialOptions),
 		stopped:     make(chan struct{}),
 	}
 

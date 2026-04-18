@@ -8,6 +8,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -29,10 +30,11 @@ type Forwarder struct {
 }
 
 // NewForwarder creates a new Forwarder with an empty connection cache.
-// ka is optional; when nil, gRPC default keepalive behavior is used.
-func NewForwarder(ka *keepalive.ClientParameters) *Forwarder {
+// ka is optional keepalive; creds overrides default insecure transport
+// credentials (nil = insecure); dialOpts are additional backend dial options.
+func NewForwarder(ka *keepalive.ClientParameters, creds credentials.TransportCredentials, dialOpts []grpc.DialOption) *Forwarder {
 	return &Forwarder{
-		cache: NewConnectionCache(ka),
+		cache: NewConnectionCache(ka, creds, dialOpts),
 	}
 }
 

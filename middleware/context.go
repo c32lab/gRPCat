@@ -57,7 +57,7 @@ type Context struct {
 func NewContext(req *RequestInfo, middlewares []Middleware) *Context {
 	return &Context{
 		Request:     req,
-		Metadata:    req.Metadata,
+		Metadata:    metadata.MD{},
 		values:      make(map[string]any),
 		middlewares: middlewares,
 		index:       -1,
@@ -156,7 +156,7 @@ func (c *Context) AddMetadata(key, value string) {
 // Init initializes the context with request info and middlewares
 func (c *Context) Init(req *RequestInfo, middlewares []Middleware) {
 	c.Request = req
-	c.Metadata = req.Metadata
+	c.Metadata = metadata.MD{}
 	c.middlewares = middlewares
 	c.index = -1
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/c32lab/gRPCat/middleware"
 )
 
 func TestForwarder_UnaryRPC(t *testing.T) {
@@ -503,7 +506,7 @@ func startClientStreamingBackend(t *testing.T) string {
 						}
 						count++
 					}
-					return stream.SendMsg(&Frame{data: buildGRPCMessage([]byte(itoa(count)))})
+					return stream.SendMsg(&Frame{data: buildGRPCMessage([]byte(strconv.Itoa(count)))})
 				},
 			},
 		},
@@ -552,24 +555,99 @@ func startBidiEchoBackend(t *testing.T) string {
 	return lis.Addr().String()
 }
 
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
+// TestForwarder_MetadataNotDoubled verifies that metadata keys are forwarded
+// exactly once to the backend, not doubled by the Join(incoming, incoming)
+// bug that existed when mwCtx.Metadata aliased the incoming MD.
+func TestForwarder_MetadataNotDoubled(t *testing.T) {
+	receivedMD := make(chan metadata.MD, 1)
+	backendAddr := startMetadataCapturingBackend(t, receivedMD)
+	proxyAddr := startProxyServer(t, backendAddr)
+
+	conn, err := grpc.NewClient(proxyAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
 	}
-	neg := i < 0
-	if neg {
-		i = -i
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	md := metadata.Pairs("x-unique-key", "single-value")
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	err = conn.Invoke(ctx, "/test.Echo/Echo",
+		&Frame{data: buildGRPCMessage([]byte("md"))},
+		&Frame{},
+	)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
 	}
-	var buf [20]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
+
+	select {
+	case gotMD := <-receivedMD:
+		vals := gotMD.Get("x-unique-key")
+		if len(vals) != 1 {
+			t.Errorf("expected x-unique-key to appear exactly once, got %d times: %v", len(vals), vals)
+		}
+		if len(vals) > 0 && vals[0] != "single-value" {
+			t.Errorf("expected 'single-value', got %q", vals[0])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for metadata")
 	}
-	if neg {
-		pos--
-		buf[pos] = '-'
+}
+
+// TestForwarder_MiddlewareAbortStatus verifies that when a middleware calls
+// AbortWithError, the client receives the exact status code and message.
+func TestForwarder_MiddlewareAbortStatus(t *testing.T) {
+	backendAddr := startEchoBackend(t)
+
+	srv, err := NewServer(&Config{DefaultBackend: backendAddr})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
 	}
-	return string(buf[pos:])
+
+	srv.Use(middleware.MiddlewareFunc(func(ctx *middleware.Context) {
+		ctx.AbortWithError(codes.NotFound, "gone")
+	}))
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go srv.grpcServer.Serve(lis)
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient(lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = conn.Invoke(ctx, "/test.Echo/Echo",
+		&Frame{data: buildGRPCMessage([]byte("x"))},
+		&Frame{},
+	)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected status error, got %T: %v", err, err)
+	}
+	if st.Code() != codes.NotFound {
+		t.Errorf("code: want NotFound, got %v", st.Code())
+	}
+	if st.Message() != "gone" {
+		t.Errorf("message: want %q, got %q", "gone", st.Message())
+	}
 }
