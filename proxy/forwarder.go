@@ -177,6 +177,11 @@ func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.Serve
 		frame := &Frame{}
 		for i := 0; ; i++ {
 			if err := src.RecvMsg(frame); err != nil {
+				if err == io.EOF && i == 0 {
+					if md, hErr := src.Header(); hErr == nil {
+						dst.SendHeader(md)
+					}
+				}
 				ret <- err
 				break
 			}

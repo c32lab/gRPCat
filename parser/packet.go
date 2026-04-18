@@ -41,6 +41,10 @@ func ParseGRPCMessage(data []byte) (*GRPCMessage, error) {
 	return msg, nil
 }
 
+// MaxMessageSize is the maximum allowed gRPC message payload size (4 MB),
+// matching the default grpc-go limit.
+const MaxMessageSize = 4 << 20
+
 // ParseGRPCMessageFromReader reads and parses a gRPC message from an io.Reader
 func ParseGRPCMessageFromReader(reader io.Reader) (*GRPCMessage, error) {
 	// Read header (5 bytes)
@@ -52,6 +56,10 @@ func ParseGRPCMessageFromReader(reader io.Reader) (*GRPCMessage, error) {
 	msg := &GRPCMessage{}
 	msg.Compressed = header[0] == 1
 	msg.Length = binary.BigEndian.Uint32(header[1:5])
+
+	if msg.Length > MaxMessageSize {
+		return nil, fmt.Errorf("message too large: %d bytes (max %d)", msg.Length, MaxMessageSize)
+	}
 
 	// Read payload
 	msg.Payload = make([]byte, msg.Length)

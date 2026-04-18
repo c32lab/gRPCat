@@ -49,6 +49,13 @@ func TestNewServer_RequiresBackend(t *testing.T) {
 	}
 }
 
+func TestNewServer_NilConfig(t *testing.T) {
+	_, err := NewServer(nil)
+	if err == nil {
+		t.Error("expected error when config is nil")
+	}
+}
+
 // TestServer_StopClosesBackendConnections verifies that Stop tears down
 // pooled backend connections.
 func TestServer_StopClosesBackendConnections(t *testing.T) {

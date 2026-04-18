@@ -48,6 +48,9 @@ type Server struct {
 }
 
 func NewServer(config *Config) (*Server, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
 	if config.DefaultBackend == "" {
 		return nil, fmt.Errorf("must specify DefaultBackend")
 	}
@@ -185,6 +188,9 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 				copy(firstPayload, msg.Payload)
 			}
 		} else if firstFrameErr != nil && firstFrameErr != io.EOF {
+			if _, ok := status.FromError(firstFrameErr); ok {
+				return firstFrameErr
+			}
 			return status.Errorf(codes.Internal, "failed to read first frame: %v", firstFrameErr)
 		}
 
@@ -238,8 +244,9 @@ func handleAborted(serverStream grpc.ServerStream, mwCtx *middleware.Context) er
 	}
 
 	// If middleware provided custom response data, send it to client
-	if len(mwCtx.Response.Data) > 0 {
-		mockFrame := &Frame{data: mwCtx.Response.Data}
+	if mwCtx.Response.Data != nil {
+		grpcMsg := &parser.GRPCMessage{Payload: mwCtx.Response.Data}
+		mockFrame := &Frame{data: parser.EncodeGRPCMessage(grpcMsg)}
 		if err := serverStream.SendMsg(mockFrame); err != nil {
 			return status.Errorf(codes.Internal, "failed to send response: %v", err)
 		}

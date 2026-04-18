@@ -126,8 +126,11 @@ func (c *Context) AbortWithError(code codes.Code, msg string) {
 	c.Abort()
 }
 
-// SendResponse sends a custom response and stops execution
+// SendResponse sends a custom response (raw protobuf bytes) and stops execution
 func (c *Context) SendResponse(data []byte) {
+	if data == nil {
+		data = []byte{}
+	}
 	c.Response = &ResponseInfo{
 		Data: data,
 		Code: codes.OK,

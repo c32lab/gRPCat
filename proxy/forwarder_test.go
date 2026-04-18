@@ -651,3 +651,118 @@ func TestForwarder_MiddlewareAbortStatus(t *testing.T) {
 		t.Errorf("message: want %q, got %q", "gone", st.Message())
 	}
 }
+
+// TestForwarder_MiddlewareSendEmptyResponse verifies that SendResponse([]byte{})
+// returns a successful empty response rather than falling through to the error branch.
+func TestForwarder_MiddlewareSendEmptyResponse(t *testing.T) {
+	backendAddr := startEchoBackend(t)
+
+	srv, err := NewServer(&Config{DefaultBackend: backendAddr})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	srv.Use(middleware.MiddlewareFunc(func(ctx *middleware.Context) {
+		ctx.SendResponse([]byte{})
+	}))
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go srv.grpcServer.Serve(lis)
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient(lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := &Frame{}
+	err = conn.Invoke(ctx, "/test.Echo/Echo",
+		&Frame{data: buildGRPCMessage([]byte("x"))},
+		resp,
+	)
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+}
+
+// TestForwarder_EmptyStreamForwardsHeaders verifies that when the backend
+// returns EOF with no messages, the proxy still forwards response headers.
+func TestForwarder_EmptyStreamForwardsHeaders(t *testing.T) {
+	backendAddr := startEmptyStreamBackend(t)
+	proxyAddr := startProxyServer(t, backendAddr)
+
+	conn, err := grpc.NewClient(proxyAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := conn.NewStream(ctx, clientStreamDesc, "/test.Echo/ServerStream")
+	if err != nil {
+		t.Fatalf("new stream: %v", err)
+	}
+	if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte("x"))}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("close send: %v", err)
+	}
+
+	// Backend returns EOF immediately; headers should still be forwarded.
+	md, err := stream.Header()
+	if err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	vals := md.Get("x-empty-stream")
+	if len(vals) == 0 || vals[0] != "true" {
+		t.Errorf("expected header x-empty-stream=true, got %v", vals)
+	}
+}
+
+// startEmptyStreamBackend starts a backend that sends a header then returns
+// EOF with no response messages.
+func startEmptyStreamBackend(t *testing.T) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	server.RegisterService(&grpc.ServiceDesc{
+		ServiceName: "test.Echo",
+		HandlerType: (*any)(nil),
+		Streams: []grpc.StreamDesc{
+			{
+				StreamName:    "ServerStream",
+				ServerStreams:  true,
+				Handler: func(srv any, stream grpc.ServerStream) error {
+					// Consume the client message
+					frame := &Frame{}
+					stream.RecvMsg(frame)
+					// Send header but no messages
+					stream.SendHeader(metadata.Pairs("x-empty-stream", "true"))
+					return nil
+				},
+			},
+		},
+	}, nil)
+	go server.Serve(lis)
+	t.Cleanup(func() { server.Stop() })
+	return lis.Addr().String()
+}
