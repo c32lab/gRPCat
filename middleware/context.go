@@ -156,16 +156,9 @@ func (c *Context) AddMetadata(key, value string) {
 	c.Metadata.Append(key, value)
 }
 
-// Init initializes the context with request info and middlewares
-func (c *Context) Init(req *RequestInfo, middlewares []Middleware) {
-	c.Request = req
-	c.Metadata = metadata.MD{}
-	c.middlewares = middlewares
-	c.index = -1
-}
-
-// Reset resets the context for reuse (called by sync.Pool)
-func (c *Context) Reset() {
+// reset clears the context for reuse via the pool. Unexported because pool
+// lifecycle is owned by AcquireContext/ReleaseContext.
+func (c *Context) reset() {
 	c.Request = nil
 	c.Response = nil
 	c.Backend = ""

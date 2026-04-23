@@ -33,6 +33,20 @@ type Config struct {
 	// Note: unary interceptors have no effect because all RPCs are
 	// proxied as bidirectional streams via grpc.NewClientStream.
 	BackendDialOptions []grpc.DialOption
+	// Hooks supplies optional callbacks for proxy lifecycle events. Leave
+	// nil to disable all hooks.
+	Hooks *Hooks
+}
+
+// Hooks groups optional callbacks the proxy invokes at well-defined points.
+// All fields are optional; a nil field means "no callback".
+type Hooks struct {
+	// OnFirstFrameError is called when the first message frame from the
+	// client cannot be parsed as a gRPC message. Returning a non-nil
+	// error aborts the request with that error (sent to the client);
+	// returning nil lets the request proceed into the middleware chain
+	// with RequestInfo.FirstPayload set to nil.
+	OnFirstFrameError func(req *middleware.RequestInfo, err error) error
 }
 
 type Server struct {
@@ -40,7 +54,6 @@ type Server struct {
 	mu          sync.RWMutex
 	middlewares []middleware.Middleware
 	grpcServer  *grpc.Server
-	contextPool sync.Pool
 	forwarder   *Forwarder
 
 	stopOnce sync.Once
@@ -60,11 +73,6 @@ func NewServer(config *Config) (*Server, error) {
 		middlewares: []middleware.Middleware{},
 		forwarder:   NewForwarder(config.KeepaliveParams, config.BackendTransportCreds, config.BackendDialOptions),
 		stopped:     make(chan struct{}),
-	}
-
-	// Initialize context pool for reusing middleware contexts
-	server.contextPool.New = func() any {
-		return &middleware.Context{}
 	}
 
 	server.grpcServer = grpc.NewServer(
@@ -132,15 +140,7 @@ func (s *Server) snapshotMiddlewares() []middleware.Middleware {
 
 // acquireContext gets a context from the pool and initializes it
 func (s *Server) acquireContext(req *middleware.RequestInfo) *middleware.Context {
-	ctx := s.contextPool.Get().(*middleware.Context)
-	ctx.Init(req, s.snapshotMiddlewares())
-	return ctx
-}
-
-// releaseContext resets and returns a context to the pool
-func (s *Server) releaseContext(ctx *middleware.Context) {
-	ctx.Reset()
-	s.contextPool.Put(ctx)
+	return middleware.AcquireContext(req, s.snapshotMiddlewares())
 }
 
 // TransparentHandler creates a grpc.StreamHandler that proxies all requests.
@@ -181,11 +181,14 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 
 		// Try to parse the first frame's payload for middleware inspection
 		var firstPayload []byte
+		var firstPayloadErr error
 		if firstFrameErr == nil && len(firstFrame.Data()) > 0 {
 			if msg, parseErr := parser.ParseGRPCMessage(firstFrame.Data()); parseErr == nil {
 				// Copy payload to avoid referencing gRPC's internal buffer
 				firstPayload = make([]byte, len(msg.Payload))
 				copy(firstPayload, msg.Payload)
+			} else {
+				firstPayloadErr = parseErr
 			}
 		} else if firstFrameErr != nil && firstFrameErr != io.EOF {
 			if _, ok := status.FromError(firstFrameErr); ok {
@@ -202,9 +205,17 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 			FirstPayload: firstPayload,
 		}
 
+		// Invoke OnFirstFrameError hook if parsing failed and a hook is set.
+		// A non-nil return aborts the request with that error.
+		if firstPayloadErr != nil && s.config.Hooks != nil && s.config.Hooks.OnFirstFrameError != nil {
+			if hookErr := s.config.Hooks.OnFirstFrameError(requestInfo, firstPayloadErr); hookErr != nil {
+				return hookErr
+			}
+		}
+
 		// Acquire context from pool and initialize it
 		mwCtx := s.acquireContext(requestInfo)
-		defer s.releaseContext(mwCtx)
+		defer middleware.ReleaseContext(mwCtx)
 
 		// Execute middleware chain
 		mwCtx.Next()

@@ -143,7 +143,7 @@ func TestContext_Reset(t *testing.T) {
 	ctx.Backend = "backend"
 	ctx.Response = &ResponseInfo{Code: codes.OK}
 
-	ctx.Reset()
+	ctx.reset()
 
 	if ctx.Request != nil {
 		t.Error("expected Request to be nil")
