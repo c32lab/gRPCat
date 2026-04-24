@@ -17,10 +17,10 @@ A lightweight, high-performance gRPC proxy with gin-style middleware support.
 
 ## Features
 
-- **Zero-copy forwarding** - Proxies gRPC without deserializing protobuf
+- **No protobuf parsing** - Forwards raw gRPC frames; the first frame is buffered for middleware inspection, the rest pass straight through.
 - **Middleware chain** - Logging, routing, rate limiting, etc.
-- **All streaming modes** - Unary, server, client, bidirectional
-- **Service agnostic** - No .proto files required
+- **All streaming modes** - Unary, server, client, bidirectional.
+- **Service agnostic** - No `.proto` files required.
 
 ## Installation
 
@@ -43,6 +43,16 @@ grpcat -backend localhost:50051 \
   -v
 ```
 
+CLI flags:
+
+| Flag        | Description                                                 |
+|-------------|-------------------------------------------------------------|
+| `-backend`  | Default backend gRPC address (e.g. `localhost:50051`)       |
+| `-listen`   | Listen address (default `:8080`)                            |
+| `-route`    | Per-service route `service=backend`, repeatable             |
+| `-v`        | Verbose logging                                             |
+| `-version`  | Print version and exit                                      |
+
 ### Library Usage
 
 ```go
@@ -50,36 +60,64 @@ package main
 
 import (
     "context"
+    "log"
+
     "github.com/c32lab/gRPCat/proxy"
-    "github.com/c32lab/gRPCat/middleware"
 )
 
 func main() {
-    server, _ := proxy.NewServer(&proxy.Config{
+    server, err := proxy.NewServer(&proxy.Config{
         DefaultBackend: "localhost:50051",
     })
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    // Add middleware
     server.Use(&LoggingMiddleware{})
 
-    server.Start(context.Background(), ":8080")
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    // Start blocks until the listener stops; cancel ctx or call
+    // server.Stop() from elsewhere to shut down gracefully.
+    if err := server.Start(ctx, ":8080"); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
+
+To attach extra services (health, reflection, your own gRPC handlers) on the
+same listener, use `server.GetGRPCServer()` and register before `Start`.
 
 ### Config Options
 
 ```go
-proxy.Config{
+import (
+    "github.com/c32lab/gRPCat/middleware"
+    "github.com/c32lab/gRPCat/proxy"
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/credentials"
+    "google.golang.org/grpc/keepalive"
+    "google.golang.org/grpc/status"
+)
+
+cfg := &proxy.Config{
     DefaultBackend:        "localhost:50051",
     KeepaliveParams:       &keepalive.ClientParameters{Time: 5 * time.Minute},
     BackendTransportCreds: credentials.NewTLS(tlsConfig), // nil = insecure
     BackendDialOptions:    []grpc.DialOption{grpc.WithStatsHandler(h)},
+    Hooks: &proxy.Hooks{
+        OnFirstFrameError: func(req *middleware.RequestInfo, err error) error {
+            return status.Errorf(codes.InvalidArgument, "bad frame: %v", err)
+        },
+    },
 }
 ```
 
-- `KeepaliveParams` - Client keepalive for backend connections (nil = gRPC defaults)
-- `BackendTransportCreds` - Transport credentials for backends (nil = insecure)
-- `BackendDialOptions` - Additional dial options (stream interceptors, stats handlers, etc.; unary interceptors have no effect because all RPCs are proxied as streams)
+- `KeepaliveParams` - Client keepalive for backend connections (nil = gRPC defaults).
+- `BackendTransportCreds` - Transport credentials for backends (nil = insecure).
+- `BackendDialOptions` - Additional dial options (stream interceptors, stats handlers, etc.). Unary interceptors have no effect because all RPCs are proxied as streams.
+- `Hooks.OnFirstFrameError` - Called when the first client frame can't be parsed as a gRPC message. Return non-nil to abort with that error; return nil to let the request proceed with `RequestInfo.FirstPayload == nil`.
 
 ## Writing Middleware
 
@@ -93,16 +131,44 @@ func (m *LoggingMiddleware) Handle(ctx *middleware.Context) {
 }
 ```
 
-### Middleware Capabilities
+Inspecting the first request payload without a `.proto` file:
 
-- `ctx.Next()` - Continue to next middleware (gin-style: chain runs regardless, useful for pre/post pattern)
-- `ctx.Abort()` - Stop execution
-- `ctx.AbortWithError(code, msg)` - Stop and return gRPC error to client
-- `ctx.SendResponse(data)` - Stop and return custom response data
-- `ctx.SetBackend(addr)` - Route to specific backend
-- `ctx.AddMetadata(key, value)` - Add metadata to backend request
-- `ctx.Set/Get(key, value)` - Share data between middlewares
-- `ctx.Request` - Access service, method, metadata, first payload
+```go
+func (m *AuthMiddleware) Handle(ctx *middleware.Context) {
+    // RequestInfo.FirstPayload is the unframed protobuf body of the first
+    // client message — already copied off gRPC's transport buffer, safe to
+    // hold. Use proto.Unmarshal into your own message type if you have one,
+    // or treat it as opaque bytes for routing/auth.
+    if !looksAuthorized(ctx.Request.FirstPayload) {
+        ctx.AbortWithError(codes.PermissionDenied, "not allowed")
+        return
+    }
+    ctx.Next()
+}
+```
+
+### Middleware capabilities
+
+**Control flow**
+- `ctx.Next()` - Continue to next middleware. Gin-style: the chain runs to completion regardless of whether you call it; calling it explicitly is for the pre/post pattern (do work, `Next()`, do work).
+- `ctx.AbortWithError(code, msg)` - Stop and return a gRPC error to the client.
+- `ctx.SendResponse(data)` - Stop and return raw protobuf bytes to the client.
+- `ctx.Abort()` - Stop the chain. Use only after setting a response yourself (via `SendResponse` / `AbortWithError`); a bare `Abort()` causes the client to receive `codes.Internal "middleware aborted without response"`.
+
+**Routing & metadata**
+- `ctx.SetBackend(addr)` - Override `Config.DefaultBackend` for this request.
+- `ctx.AddMetadata(key, value)` - Add metadata to the backend request.
+
+**State**
+- `ctx.Set(key, value)` / `ctx.Get(key)` - Share data between middlewares (`any` value, thread-safe).
+- `ctx.Request` - `Service`, `Method`, `Metadata`, `FirstPayload` (see streaming caveat below).
+
+### Streaming caveat
+
+`RequestInfo.FirstPayload` only holds the **first** client message. For
+client-streaming and bidirectional RPCs, subsequent messages are forwarded
+without passing through middleware. Don't rely on middleware for per-message
+inspection of streaming RPCs — use a backend-side interceptor for that.
 
 **See `cmd/grpcat/middlewares/` for complete examples.**
 
@@ -119,6 +185,12 @@ Client → gRPCat → Middleware Chain → Backend(s)
       Forward raw gRPC frames
       (no protobuf parsing)
 ```
+
+Because gRPCat uses a custom codec that hands gRPC raw bytes instead of
+parsed protobuf messages, it doesn't need `.proto` descriptors and avoids
+per-message marshalling overhead. Middlewares get a parsed view of the
+first frame for routing/auth decisions; everything else is byte-for-byte
+forwarding.
 
 ## Use Cases
 
