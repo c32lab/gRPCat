@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -71,7 +72,15 @@ func init() {
 	flag.Var(&routes, "route", "Route service to backend (format: service=backend, can specify multiple times)")
 }
 
-const versionInfo = "gRPCat v0.1.0"
+// versionString reports the module version the binary was built from. A
+// `go install ...@latest` build carries the real tag (or a pseudo-version);
+// hardcoding one here would report a stale number forever.
+func versionString() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		return "gRPCat " + info.Main.Version
+	}
+	return "gRPCat (unknown version)"
+}
 
 // parseRoute splits a -route value into service and backend. It cuts on the
 // first '=' only, so backends containing '=' are preserved.
@@ -128,7 +137,7 @@ func main() {
 	flag.Parse()
 
 	if *version {
-		fmt.Println(versionInfo)
+		fmt.Println(versionString())
 		os.Exit(0)
 	}
 
