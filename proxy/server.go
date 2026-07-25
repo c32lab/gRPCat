@@ -39,6 +39,8 @@ type Config struct {
 	// the backend leg.
 	// Note: unary interceptors have no effect because all RPCs are
 	// proxied as bidirectional streams via grpc.NewClientStream.
+	// Note: a stats.Handler receives *Frame as InPayload/OutPayload.Payload;
+	// see ServerOptions for the lifetime caveat.
 	BackendDialOptions []grpc.DialOption
 	// ServerOptions supplies additional grpc.ServerOption values for the
 	// listening side (TLS credentials, keepalive enforcement, max concurrent
@@ -47,6 +49,10 @@ type Config struct {
 	// win on conflict.
 	// Note: unary interceptors have no effect because all RPCs are handled
 	// as streams via grpc.UnknownServiceHandler.
+	// Note: a stats.Handler receives *Frame as InPayload/OutPayload.Payload.
+	// Read it with Frame.Data inside the callback; retaining the *Frame and
+	// reading it later yields nil, because the proxy frees the message once
+	// it has been forwarded.
 	ServerOptions []grpc.ServerOption
 	// Hooks supplies optional callbacks for proxy lifecycle events. Leave
 	// nil to disable all hooks.

@@ -41,6 +41,14 @@ func frameFromBytes(b []byte) *Frame {
 // the bytes cannot be aliased out: Data allocates and copies. The returned
 // slice is independent of the frame and stays valid after Free, which is what
 // makes it safe to hand to middleware. It is nil for an empty frame.
+//
+// Data on an already-freed Frame returns nil rather than stale bytes. This
+// matters for stats handlers: gRPC passes the *Frame itself as
+// stats.InPayload.Payload / stats.OutPayload.Payload, and the proxy frees it
+// once the message has been handed on. Handlers are invoked synchronously, so
+// calling Data inside the callback is correct; retaining the *Frame and
+// reading it after the RPC yields nil, and reading it from another goroutine
+// races with Free.
 func (f *Frame) Data() []byte {
 	return f.data.Materialize()
 }

@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/experimental"
 	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -623,5 +624,93 @@ func TestProxy_UnaryRPCsDoNotLeakPooledBuffers(t *testing.T) {
 		t.Errorf("outstanding pooled buffers grew by %d over an identical batch of %d unary RPCs "+
 			"(%d -> %d): a per-stream reference is not being released",
 			growth, batch, afterFirst, afterSecond)
+	}
+}
+
+// statsFrameHandler mimics a stats.Handler that both reads the payload
+// synchronously (correct) and retains the *Frame to read later (incorrect).
+type statsFrameHandler struct {
+	mu        sync.Mutex
+	inCall    [][]byte
+	retained  []*Frame
+	sawFrames int
+}
+
+func (h *statsFrameHandler) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+func (h *statsFrameHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+func (h *statsFrameHandler) HandleConn(context.Context, stats.ConnStats) {}
+
+func (h *statsFrameHandler) HandleRPC(_ context.Context, s stats.RPCStats) {
+	in, ok := s.(*stats.InPayload)
+	if !ok {
+		return
+	}
+	f, ok := in.Payload.(*Frame)
+	if !ok {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sawFrames++
+	h.inCall = append(h.inCall, f.Data())
+	h.retained = append(h.retained, f)
+}
+
+// TestStatsHandler_FramePayloadLifetime pins the contract documented on
+// Config.ServerOptions and Frame.Data: a stats handler reading the payload
+// synchronously inside the callback sees the real bytes, while one that
+// retains the *Frame and reads it after the RPC sees nil rather than another
+// request's recycled bytes.
+func TestStatsHandler_FramePayloadLifetime(t *testing.T) {
+	h := &statsFrameHandler{}
+	backendAddr := startProtoEchoBackend(t)
+
+	srv, err := NewServer(&Config{
+		DefaultBackend: backendAddr,
+		ServerOptions:  []grpc.ServerOption{grpc.StatsHandler(h)},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	cc := dialProtoProxy(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const want = "stats-payload"
+	out := &wrapperspb.StringValue{}
+	if err := cc.Invoke(ctx, "/test.ProtoEcho/Echo", &wrapperspb.StringValue{Value: want}, out); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	// Churn the buffer pool so a use-after-free would surface as someone
+	// else's bytes rather than staying quietly intact.
+	for i := 0; i < 20; i++ {
+		if err := cc.Invoke(ctx, "/test.ProtoEcho/Echo",
+			&wrapperspb.StringValue{Value: "churn"}, &wrapperspb.StringValue{}); err != nil {
+			t.Fatalf("churn invoke %d: %v", i, err)
+		}
+	}
+
+	wantWire, err := proto.Marshal(&wrapperspb.StringValue{Value: want})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.sawFrames == 0 {
+		t.Fatal("stats handler received no *Frame payloads; the contract under test never ran")
+	}
+	if !bytes.Equal(h.inCall[0], wantWire) {
+		t.Errorf("synchronous read inside the callback must see the real payload:\n want %x\n  got %x",
+			wantWire, h.inCall[0])
+	}
+	if got := h.retained[0].Data(); got != nil {
+		t.Errorf("deferred read of a retained *Frame must be nil, not stale or recycled bytes; got %x", got)
 	}
 }
