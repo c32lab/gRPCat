@@ -752,7 +752,7 @@ func startEmptyStreamBackend(t *testing.T) string {
 		Streams: []grpc.StreamDesc{
 			{
 				StreamName:    "ServerStream",
-				ServerStreams:  true,
+				ServerStreams: true,
 				Handler: func(srv any, stream grpc.ServerStream) error {
 					// Consume the client message
 					frame := &Frame{}
