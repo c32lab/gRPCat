@@ -1,6 +1,23 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"google.golang.org/grpc/encoding"
+)
+
+// TestGzipCompressorRegistered pins the gzip registration this example relies
+// on: gRPC decompresses requests at the proxy, so a proxy process without the
+// compressor rejects gzip requests with
+// `Unimplemented: grpc: Decompressor is not installed for grpc-encoding "gzip"`.
+// The rejection itself can only be reproduced in a separate process (encoding
+// registration is global and this test binary links the example's import), so
+// the registration is what is asserted here.
+func TestGzipCompressorRegistered(t *testing.T) {
+	if encoding.GetCompressor("gzip") == nil {
+		t.Fatal("gzip compressor not registered: the proxy would reject gzip-compressed requests with Unimplemented")
+	}
+}
 
 func TestParseRoute(t *testing.T) {
 	tests := []struct {

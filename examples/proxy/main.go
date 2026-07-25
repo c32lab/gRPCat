@@ -12,6 +12,12 @@ import (
 
 	"github.com/c32lab/gRPCat/examples/middlewares"
 	"github.com/c32lab/gRPCat/proxy"
+
+	// gRPC decompresses requests at the proxy, so this process must have the
+	// client's compressor registered or compressed requests are rejected with
+	// Unimplemented. Register gzip, the common case; add other encodings the
+	// same way.
+	_ "google.golang.org/grpc/encoding/gzip"
 )
 
 const banner = `

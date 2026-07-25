@@ -17,7 +17,7 @@ A lightweight, high-performance gRPC proxy with gin-style middleware support.
 
 ## Features
 
-- **No protobuf parsing** - Forwards raw gRPC frames; the first frame is buffered for middleware inspection, the rest pass straight through.
+- **No protobuf parsing** - Forwards raw gRPC frames; the first frame is buffered for middleware inspection, the rest pass straight through. Compressed messages are the exception: they are decompressed at the proxy (see [Compression](#compression)).
 - **Middleware chain** - Logging, routing, rate limiting, etc.
 - **All streaming modes** - Unary, server, client, bidirectional.
 - **Service agnostic** - No `.proto` files required.
@@ -202,7 +202,28 @@ Because gRPCat uses a custom codec that hands gRPC raw bytes instead of
 parsed protobuf messages, it doesn't need `.proto` descriptors and avoids
 per-message marshalling overhead. Middlewares get a parsed view of the
 first frame for routing/auth decisions; everything else is byte-for-byte
-forwarding.
+forwarding — except for compressed messages, see below.
+
+### Compression
+
+**Compression is terminated at the proxy, not passed through.** gRPC
+decompresses an incoming message before the codec sees it, so what gRPCat
+forwards is the *uncompressed* frame. Concretely:
+
+- **The proxy process must have the client's compressor registered**, otherwise
+  compressed requests are rejected with
+  `Unimplemented: grpc: Decompressor is not installed for grpc-encoding "gzip"`.
+  Register it by importing the encoding package for its side effect, e.g.
+  `import _ "google.golang.org/grpc/encoding/gzip"` (as `examples/proxy` does).
+- **The proxy → backend leg is always uncompressed**, whatever the client sent.
+  Bandwidth between proxy and backend is higher than the client asked for.
+- **Responses to the client are compressed with the encoding the *client*
+  requested**, because gRPC mirrors the request's encoding on the response. The
+  encoding the *backend* chose is not propagated: a backend response compressed
+  via `grpc.SetSendCompressor` is decompressed at the proxy and reaches a client
+  that didn't request compression uncompressed.
+
+End-to-end passthrough of compressed frames is not supported.
 
 ## Use Cases
 

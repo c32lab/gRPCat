@@ -62,11 +62,14 @@ func (f *Forwarder) Forward(
 	additionalMD metadata.MD,
 	firstFrame *Frame,
 ) error {
-	// Get or create connection to backend server
-	conn, err := f.cache.Get(backend)
+	// Get or create connection to backend server. acquire pins it against
+	// idle eviction until release runs, so a long-lived proxied stream is
+	// never cancelled by the cache's idle sweeper.
+	conn, release, err := f.cache.acquire(backend)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "failed to connect to backend %s: %v", backend, err)
 	}
+	defer release()
 
 	// Create cancellable context for backend stream.
 	// This allows us to cancel the backend stream when client disconnects.
@@ -145,6 +148,13 @@ func (f *Forwarder) Forward(
 				// exact failure the backend produced.
 				clientCancel()
 				serverStream.SetTrailer(clientStream.Trailer())
+				// Deliberately NOT waiting for forwardClientToBackend here:
+				// it is parked in serverStream.RecvMsg, which only unblocks on
+				// client activity or on gRPC cancelling the stream context -
+				// and gRPC does that when this handler returns. Waiting would
+				// deadlock. Returning is safe because that goroutine only
+				// READS serverStream, and once the stream is done its cleanup
+				// (WriteStatus) is a no-op.
 				return s2cErr
 			}
 		case c2sErr := <-c2sErrChan:
@@ -153,6 +163,26 @@ func (f *Forwarder) Forward(
 				// the backend stream and return the client's error as-is so
 				// its status code (typically Canceled) is preserved.
 				clientCancel()
+				// forwardBackendToClient WRITES to serverStream, which is only
+				// valid while this handler runs, so drain it before returning -
+				// but ONLY once the server stream's context is already done.
+				// A pending serverStream.SendMsg parks on HTTP/2 write flow
+				// control, and that wait is released by the client reading or
+				// by the stream context being cancelled - which gRPC only does
+				// after this handler returns. Waiting unconditionally is a
+				// circular wait: a client that stops reading would pin the
+				// handler, its stream and the backend stream forever.
+				// A live context here means the failure was on the backend leg
+				// (e.g. a message over MaxSendMsgSize) while the client is
+				// still connected. We then return with that goroutine possibly
+				// still in flight; the surviving window is one SendMsg, which
+				// gRPC rejects with an error once the stream is done rather
+				// than corrupting it.
+				// i == 0 means this direction has not been received yet (each
+				// goroutine sends exactly once).
+				if i == 0 && serverStream.Context().Err() != nil {
+					<-s2cErrChan
+				}
 				return c2sErr
 			}
 			// Client finished sending all requests (io.EOF).

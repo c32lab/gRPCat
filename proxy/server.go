@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/c32lab/gRPCat/middleware"
 	"github.com/c32lab/gRPCat/parser"
@@ -62,6 +63,23 @@ type Config struct {
 	// proxy will buffer whatever a peer sends, which is a DoS surface.
 	MaxRecvMsgSize int
 	MaxSendMsgSize int
+	// BackendIdleTimeout evicts a pooled backend connection once it has gone
+	// unused for this long: the proxy closes it, drops it from the cache, and
+	// re-dials on the next request for that address. Zero (the default)
+	// disables eviction, so connections live until Stop — today's behavior.
+	// Set it when backends come and go (service discovery, tenant routing),
+	// where the cache would otherwise grow one connection per address seen.
+	//
+	// Eviction never cancels an RPC the proxy is forwarding: the cache counts
+	// the streams it has open on each connection and skips any connection
+	// whose count is non-zero, so a stream may run far longer than this
+	// timeout. (connectivity.Idle on its own is not that signal - a backend
+	// GOAWAY reports Idle while streams keep draining - so it is only used as
+	// an extra filter.) The proxy sets grpc.WithIdleTimeout on backend
+	// connections to drive that state; a WithIdleTimeout inside
+	// BackendDialOptions overrides it because those are applied afterwards,
+	// and setting it to 0 there disables eviction.
+	BackendIdleTimeout time.Duration
 }
 
 // Hooks groups optional callbacks the proxy invokes at well-defined points.
@@ -114,6 +132,8 @@ func NewServer(config *Config) (*Server, error) {
 	}
 	server.forwarder.cache.maxRecvMsgSize = maxRecvMsgSize
 	server.forwarder.cache.maxSendMsgSize = maxSendMsgSize
+	server.forwarder.cache.idleTimeout = config.BackendIdleTimeout
+	server.forwarder.cache.startSweeper()
 
 	serverOpts := []grpc.ServerOption{
 		grpc.ForceServerCodec(&ProxyCodec{}),
