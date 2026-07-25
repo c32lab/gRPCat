@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	"google.golang.org/grpc"
@@ -94,6 +95,13 @@ func (f *Forwarder) Forward(
 	// send it to backend before starting bidirectional forwarding.
 	if firstFrame != nil {
 		if err := clientStream.SendMsg(firstFrame); err != nil {
+			// A status error already carries the real code (e.g.
+			// ResourceExhausted when the frame is over MaxSendMsgSize).
+			// Pass it through so the first message fails with the same
+			// code forwardClientToBackend gives every later one.
+			if _, ok := status.FromError(err); ok {
+				return err
+			}
 			return status.Errorf(codes.Internal, "failed to send first frame: %v", err)
 		}
 	}
@@ -121,7 +129,7 @@ func (f *Forwarder) Forward(
 	for i := 0; i < 2; i++ {
 		select {
 		case s2cErr := <-s2cErrChan:
-			if s2cErr == io.EOF {
+			if errors.Is(s2cErr, io.EOF) {
 				// Backend finished sending responses.
 				// Close our send side to backend (if not already closed).
 				// Even if c2s is still forwarding, backend completing usually means
@@ -140,7 +148,7 @@ func (f *Forwarder) Forward(
 				return s2cErr
 			}
 		case c2sErr := <-c2sErrChan:
-			if c2sErr != io.EOF {
+			if !errors.Is(c2sErr, io.EOF) {
 				// Error reading from client (disconnect, cancellation). Cancel
 				// the backend stream and return the client's error as-is so
 				// its status code (typically Canceled) is preserved.
@@ -177,7 +185,7 @@ func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.Serve
 		frame := &Frame{}
 		for i := 0; ; i++ {
 			if err := src.RecvMsg(frame); err != nil {
-				if err == io.EOF && i == 0 {
+				if errors.Is(err, io.EOF) && i == 0 {
 					if md, hErr := src.Header(); hErr == nil {
 						dst.SendHeader(md)
 					}

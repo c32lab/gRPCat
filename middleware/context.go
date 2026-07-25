@@ -26,7 +26,12 @@ type RequestInfo struct {
 	//   - Client-streaming / Bidirectional: only the first client message.
 	//     Subsequent messages are not buffered here; middleware cannot
 	//     inspect them without additional machinery.
-	// May be nil if the payload could not be parsed as a gRPC message.
+	// May be nil if the client closed the stream without sending a message.
+	//
+	// The slice is the same buffer the proxy forwards to the backend. It is
+	// safe to read, to proto.Unmarshal, and to hold past the middleware
+	// chain, but NOT to write: mutating it changes the bytes the backend
+	// receives. Copy it first if you need to modify it.
 	FirstPayload []byte
 }
 
@@ -117,8 +122,16 @@ func (c *Context) Abort() {
 	c.index = abortIndex
 }
 
-// AbortWithError stops execution and returns an error to the client
+// AbortWithError stops execution and returns an error to the client.
+//
+// code must not be codes.OK: a status built from OK is nil, which would turn
+// the abort into a successful RPC with an empty body. codes.OK is therefore
+// normalized to codes.Internal. Use SendResponse to abort with a successful
+// response.
 func (c *Context) AbortWithError(code codes.Code, msg string) {
+	if code == codes.OK {
+		code = codes.Internal
+	}
 	c.Response = &ResponseInfo{
 		Code: code,
 		Msg:  msg,

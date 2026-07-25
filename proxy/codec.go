@@ -4,7 +4,6 @@ package proxy
 import (
 	"fmt"
 
-	"github.com/c32lab/gRPCat/parser"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -21,13 +20,10 @@ func (f *Frame) Data() []byte {
 
 // ParseAs parses the frame data into a specific protobuf message type.
 // This is useful when middlewares need to inspect the actual message content.
+// The frame holds the bare protobuf payload: gRPC strips the 5-byte message
+// header before the codec runs and re-adds it on send.
 func (f *Frame) ParseAs(msg proto.Message) error {
-	grpcMsg, err := parser.ParseGRPCMessage(f.data)
-	if err != nil {
-		return fmt.Errorf("failed to parse gRPC message: %w", err)
-	}
-
-	if err := proto.Unmarshal(grpcMsg.Payload, msg); err != nil {
+	if err := proto.Unmarshal(f.data, msg); err != nil {
 		return fmt.Errorf("failed to unmarshal protobuf: %w", err)
 	}
 

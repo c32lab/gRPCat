@@ -5,6 +5,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func TestContext_MiddlewareChain(t *testing.T) {
@@ -83,6 +84,28 @@ func TestContext_AbortWithError(t *testing.T) {
 	}
 	if ctx.Response.Msg != "access denied" {
 		t.Errorf("expected 'access denied', got %s", ctx.Response.Msg)
+	}
+}
+
+func TestContext_AbortWithError_OK(t *testing.T) {
+	mw := MiddlewareFunc(func(ctx *Context) {
+		ctx.AbortWithError(codes.OK, "aborted")
+	})
+
+	req := &RequestInfo{Service: "test", Method: "Test"}
+	ctx := NewContext(req, []Middleware{mw})
+	ctx.Next()
+
+	if ctx.Response == nil {
+		t.Fatal("expected response to be set")
+	}
+	if ctx.Response.Code != codes.Internal {
+		t.Errorf("expected codes.OK to be normalized to Internal, got %v", ctx.Response.Code)
+	}
+	// status.Errorf returns nil for codes.OK, which would turn the abort into
+	// a successful RPC with an empty body.
+	if status.Errorf(ctx.Response.Code, "%s", ctx.Response.Msg) == nil {
+		t.Error("expected a non-nil status error for an aborted request")
 	}
 }
 

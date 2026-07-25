@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sync"
 
@@ -30,22 +32,55 @@ type Config struct {
 	// BackendDialOptions supplies additional grpc.DialOption values
 	// (stream interceptors, stats handlers, etc.) for backend connections.
 	// These are appended after credentials and keepalive options.
+	// They are also appended after the proxy's own default call options, so
+	// a grpc.WithDefaultCallOptions carrying grpc.MaxCallRecvMsgSize /
+	// grpc.MaxCallSendMsgSize overrides MaxRecvMsgSize / MaxSendMsgSize on
+	// the backend leg.
 	// Note: unary interceptors have no effect because all RPCs are
 	// proxied as bidirectional streams via grpc.NewClientStream.
 	BackendDialOptions []grpc.DialOption
+	// ServerOptions supplies additional grpc.ServerOption values for the
+	// listening side (TLS credentials, keepalive enforcement, max concurrent
+	// streams, stats handlers, etc.). These are appended after the proxy's
+	// own codec, unknown-service-handler and message size options, so they
+	// win on conflict.
+	// Note: unary interceptors have no effect because all RPCs are handled
+	// as streams via grpc.UnknownServiceHandler.
+	ServerOptions []grpc.ServerOption
 	// Hooks supplies optional callbacks for proxy lifecycle events. Leave
 	// nil to disable all hooks.
 	Hooks *Hooks
+	// MaxRecvMsgSize and MaxSendMsgSize bound message sizes in both
+	// directions: they apply to the proxy's server side (client-facing) and
+	// to its backend connections alike, unless overridden — a size option
+	// inside ServerOptions wins on the listening side, and one inside
+	// BackendDialOptions wins on the backend side, because both are applied
+	// after these. Zero means "no limit" (math.MaxInt32), so the proxy stays
+	// transparent and the backend keeps ownership of the policy; grpc-go's
+	// own 4MB receive default would otherwise cap throughput invisibly. Set
+	// them explicitly to re-impose a bound — an unbounded public-facing
+	// proxy will buffer whatever a peer sends, which is a DoS surface.
+	MaxRecvMsgSize int
+	MaxSendMsgSize int
 }
 
 // Hooks groups optional callbacks the proxy invokes at well-defined points.
 // All fields are optional; a nil field means "no callback".
 type Hooks struct {
-	// OnFirstFrameError is called when the first message frame from the
-	// client cannot be parsed as a gRPC message. Returning a non-nil
-	// error aborts the request with that error (sent to the client);
-	// returning nil lets the request proceed into the middleware chain
-	// with RequestInfo.FirstPayload set to nil.
+	// OnFirstFrameError is called when the first message frame cannot be
+	// read from the client stream (transport error, cancellation, or a
+	// message over the server's receive limit; a clean EOF is not an
+	// error). Returning a non-nil error makes the handler abort with that
+	// error; returning nil falls back to aborting with the underlying read
+	// error. RequestInfo.FirstPayload is nil when this fires.
+	//
+	// gRPC writes the read status to the client itself before the handler
+	// regains control, so the returned error sets the server-side result
+	// (logs, stats handlers) and not the status the client observes.
+	//
+	// It is never called for a well-formed request: gRPC strips the
+	// message header before the codec runs, so the proxy does no framing
+	// of its own and has nothing left to fail at.
 	OnFirstFrameError func(req *middleware.RequestInfo, err error) error
 }
 
@@ -68,19 +103,37 @@ func NewServer(config *Config) (*Server, error) {
 		return nil, fmt.Errorf("must specify DefaultBackend")
 	}
 
+	maxRecvMsgSize := resolveMsgSize(config.MaxRecvMsgSize)
+	maxSendMsgSize := resolveMsgSize(config.MaxSendMsgSize)
+
 	server := &Server{
 		config:      config,
 		middlewares: []middleware.Middleware{},
 		forwarder:   NewForwarder(config.KeepaliveParams, config.BackendTransportCreds, config.BackendDialOptions),
 		stopped:     make(chan struct{}),
 	}
+	server.forwarder.cache.maxRecvMsgSize = maxRecvMsgSize
+	server.forwarder.cache.maxSendMsgSize = maxSendMsgSize
 
-	server.grpcServer = grpc.NewServer(
+	serverOpts := []grpc.ServerOption{
 		grpc.ForceServerCodec(&ProxyCodec{}),
 		grpc.UnknownServiceHandler(server.TransparentHandler()),
-	)
+		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		grpc.MaxSendMsgSize(maxSendMsgSize),
+	}
+	serverOpts = append(serverOpts, config.ServerOptions...)
+	server.grpcServer = grpc.NewServer(serverOpts...)
 
 	return server, nil
+}
+
+// resolveMsgSize maps Config's "zero means no limit" convention onto the byte
+// count gRPC expects.
+func resolveMsgSize(n int) int {
+	if n <= 0 {
+		return math.MaxInt32
+	}
+	return n
 }
 
 func (s *Server) Start(ctx context.Context, addr string) error {
@@ -131,7 +184,10 @@ func (s *Server) Use(mw middleware.Middleware) {
 
 // snapshotMiddlewares returns a stable view of the middleware slice. The
 // returned slice is safe to hand to a middleware.Context even if Use is
-// called concurrently, because we never mutate an already-published slice.
+// called concurrently: Use only appends, so it writes at indices at or above
+// the length of every previously returned slice, and a reader only indexes
+// below its own snapshot's length. No reader can observe a slot being
+// written, and a reallocating append leaves the old array untouched.
 func (s *Server) snapshotMiddlewares() []middleware.Middleware {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -179,22 +235,12 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 			firstFrame.data = buf
 		}
 
-		// Try to parse the first frame's payload for middleware inspection
+		// gRPC strips the 5-byte message header before invoking the codec
+		// (rpc_util.go recv -> recvAndDecompress), so the frame already holds
+		// the bare payload. It was copied above, so middleware may keep it.
 		var firstPayload []byte
-		var firstPayloadErr error
-		if firstFrameErr == nil && len(firstFrame.Data()) > 0 {
-			if msg, parseErr := parser.ParseGRPCMessage(firstFrame.Data()); parseErr == nil {
-				// Copy payload to avoid referencing gRPC's internal buffer
-				firstPayload = make([]byte, len(msg.Payload))
-				copy(firstPayload, msg.Payload)
-			} else {
-				firstPayloadErr = parseErr
-			}
-		} else if firstFrameErr != nil && firstFrameErr != io.EOF {
-			if _, ok := status.FromError(firstFrameErr); ok {
-				return firstFrameErr
-			}
-			return status.Errorf(codes.Internal, "failed to read first frame: %v", firstFrameErr)
+		if firstFrameErr == nil {
+			firstPayload = firstFrame.Data()
 		}
 
 		// Prepare request info for middleware chain
@@ -205,12 +251,19 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 			FirstPayload: firstPayload,
 		}
 
-		// Invoke OnFirstFrameError hook if parsing failed and a hook is set.
-		// A non-nil return aborts the request with that error.
-		if firstPayloadErr != nil && s.config.Hooks != nil && s.config.Hooks.OnFirstFrameError != nil {
-			if hookErr := s.config.Hooks.OnFirstFrameError(requestInfo, firstPayloadErr); hookErr != nil {
-				return hookErr
+		// The first frame could not be read at all (transport error, not a
+		// clean EOF). Invoke the OnFirstFrameError hook if one is set; a
+		// non-nil return aborts the request with that error.
+		if firstFrameErr != nil && !errors.Is(firstFrameErr, io.EOF) {
+			if s.config.Hooks != nil && s.config.Hooks.OnFirstFrameError != nil {
+				if hookErr := s.config.Hooks.OnFirstFrameError(requestInfo, firstFrameErr); hookErr != nil {
+					return hookErr
+				}
 			}
+			if _, ok := status.FromError(firstFrameErr); ok {
+				return firstFrameErr
+			}
+			return status.Errorf(codes.Internal, "failed to read first frame: %v", firstFrameErr)
 		}
 
 		// Acquire context from pool and initialize it
@@ -254,10 +307,11 @@ func handleAborted(serverStream grpc.ServerStream, mwCtx *middleware.Context) er
 		return status.Errorf(codes.Internal, "middleware aborted without response")
 	}
 
-	// If middleware provided custom response data, send it to client
+	// If middleware provided custom response data, send it to client.
+	// gRPC prepends the 5-byte message header itself (rpc_util.go msgHeader),
+	// so the frame must carry the bare payload.
 	if mwCtx.Response.Data != nil {
-		grpcMsg := &parser.GRPCMessage{Payload: mwCtx.Response.Data}
-		mockFrame := &Frame{data: parser.EncodeGRPCMessage(grpcMsg)}
+		mockFrame := &Frame{data: mwCtx.Response.Data}
 		if err := serverStream.SendMsg(mockFrame); err != nil {
 			return status.Errorf(codes.Internal, "failed to send response: %v", err)
 		}

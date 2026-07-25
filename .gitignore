@@ -9,8 +9,7 @@
 *.dylib
 
 # Project binaries
-grpcat
-/cmd/grpcat/grpcat
+/grpcat
 
 
 # Test binary, built with `go test -c`

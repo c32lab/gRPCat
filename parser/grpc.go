@@ -19,12 +19,12 @@ type GRPCRequest struct {
 func ParseGRPCPath(path string) (service, method string, err error) {
 	path = strings.TrimPrefix(path, "/")
 
-	parts := strings.Split(path, "/")
-	if len(parts) != 2 {
+	service, method, ok := strings.Cut(path, "/")
+	if !ok || service == "" || method == "" || strings.Contains(method, "/") {
 		return "", "", fmt.Errorf("invalid gRPC path format: %s", path)
 	}
 
-	return parts[0], parts[1], nil
+	return service, method, nil
 }
 
 // FormatGRPCPath formats service and method into a gRPC path

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/c32lab/gRPCat/cmd/grpcat/middlewares"
+	"github.com/c32lab/gRPCat/examples/middlewares"
 	"github.com/c32lab/gRPCat/proxy"
 )
 
@@ -53,6 +53,16 @@ func init() {
 
 const versionInfo = "gRPCat v0.1.0"
 
+// parseRoute splits a -route value into service and backend. It cuts on the
+// first '=' only, so backends containing '=' are preserved.
+func parseRoute(r string) (service, backend string, err error) {
+	service, backend, ok := strings.Cut(r, "=")
+	if !ok {
+		return "", "", fmt.Errorf("invalid route format: %s (expected: service=backend)", r)
+	}
+	return strings.TrimSpace(service), strings.TrimSpace(backend), nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -83,12 +93,10 @@ func main() {
 	if len(routes) > 0 {
 		router := middlewares.NewRouteMiddleware()
 		for _, r := range routes {
-			parts := strings.Split(r, "=")
-			if len(parts) != 2 {
-				log.Fatalf("Invalid route format: %s (expected: service=backend)", r)
+			service, backend, err := parseRoute(r)
+			if err != nil {
+				log.Fatal(err)
 			}
-			service := strings.TrimSpace(parts[0])
-			backend := strings.TrimSpace(parts[1])
 			router.AddRoute(service, backend)
 			log.Printf("Route registered: %s -> %s", service, backend)
 		}

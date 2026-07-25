@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -9,8 +12,11 @@ import (
 
 	"github.com/c32lab/gRPCat/middleware"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func TestServer_UseNilPanics(t *testing.T) {
@@ -193,6 +199,134 @@ func TestServer_BackendDialOptionsWired(t *testing.T) {
 	}
 	if len(srv2.forwarder.cache.dialOpts) != 0 {
 		t.Errorf("expected 0 dial options by default, got %d", len(srv2.forwarder.cache.dialOpts))
+	}
+}
+
+// errRecvStream is a grpc.ServerStream whose RecvMsg always fails, used to
+// drive TransparentHandler's first-frame read-error path directly. Driving it
+// over a real connection cannot show the handler's return value: gRPC's own
+// serverStream.RecvMsg writes the read status to the client before the handler
+// ever sees the error (stream.go, deferred WriteStatus).
+type errRecvStream struct {
+	ctx     context.Context
+	recvErr error
+}
+
+func (s *errRecvStream) SetHeader(metadata.MD) error  { return nil }
+func (s *errRecvStream) SendHeader(metadata.MD) error { return nil }
+func (s *errRecvStream) SetTrailer(metadata.MD)       {}
+func (s *errRecvStream) Context() context.Context     { return s.ctx }
+func (s *errRecvStream) SendMsg(any) error            { return nil }
+func (s *errRecvStream) RecvMsg(any) error            { return s.recvErr }
+
+// methodTransportStream supplies the full method name that
+// grpc.MethodFromServerStream reads out of the stream context.
+type methodTransportStream struct{ method string }
+
+func (m *methodTransportStream) Method() string               { return m.method }
+func (m *methodTransportStream) SetHeader(metadata.MD) error  { return nil }
+func (m *methodTransportStream) SendHeader(metadata.MD) error { return nil }
+func (m *methodTransportStream) SetTrailer(metadata.MD) error { return nil }
+
+// TestTransparentHandler_FirstFrameReadError pins what the handler returns when
+// the first frame cannot be read, for each Hooks.OnFirstFrameError outcome.
+func TestTransparentHandler_FirstFrameReadError(t *testing.T) {
+	statusErr := status.Error(codes.Unavailable, "transport closed")
+	plainErr := errors.New("boom")
+	hookErr := status.Error(codes.FailedPrecondition, "hook-abort")
+
+	tests := []struct {
+		name    string
+		recvErr error
+		hook    func(*middleware.RequestInfo, error) error
+		want    error  // exact error, when non-nil
+		wantMsg string // otherwise match code+message
+	}{
+		{
+			name:    "hook error is returned verbatim",
+			recvErr: statusErr,
+			hook:    func(*middleware.RequestInfo, error) error { return hookErr },
+			want:    hookErr,
+		},
+		{
+			name:    "hook returning nil falls back to the read status",
+			recvErr: statusErr,
+			hook:    func(*middleware.RequestInfo, error) error { return nil },
+			want:    statusErr,
+		},
+		{
+			name:    "no hook keeps the read status",
+			recvErr: statusErr,
+			want:    statusErr,
+		},
+		{
+			name:    "non-status read error becomes Internal",
+			recvErr: plainErr,
+			wantMsg: "failed to read first frame: boom",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{DefaultBackend: "127.0.0.1:1"}
+			if tt.hook != nil {
+				cfg.Hooks = &Hooks{OnFirstFrameError: tt.hook}
+			}
+			srv, err := NewServer(cfg)
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			var mwRan bool
+			srv.Use(middleware.MiddlewareFunc(func(ctx *middleware.Context) { mwRan = true }))
+
+			ctx := grpc.NewContextWithServerTransportStream(context.Background(),
+				&methodTransportStream{method: "/test.Echo/Echo"})
+			got := srv.TransparentHandler()(nil, &errRecvStream{ctx: ctx, recvErr: tt.recvErr})
+
+			if tt.want != nil {
+				if got != tt.want {
+					t.Errorf("handler error: want %v got %v", tt.want, got)
+				}
+			} else {
+				st, ok := status.FromError(got)
+				if !ok || st.Code() != codes.Internal || st.Message() != tt.wantMsg {
+					t.Errorf("handler error: want Internal/%q got %v", tt.wantMsg, got)
+				}
+			}
+			if mwRan {
+				t.Error("middleware chain ran despite the first-frame read failure")
+			}
+		})
+	}
+}
+
+// TestTransparentHandler_WrappedEOFFirstFrame pins that a first-frame error
+// wrapping io.EOF is treated as a client that sent no message, not as a read
+// failure: the middleware chain still runs.
+func TestTransparentHandler_WrappedEOFFirstFrame(t *testing.T) {
+	srv, err := NewServer(&Config{DefaultBackend: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	var mwRan bool
+	// Abort so the request never reaches the (unreachable) backend.
+	srv.Use(middleware.MiddlewareFunc(func(ctx *middleware.Context) {
+		mwRan = true
+		ctx.AbortWithError(codes.FailedPrecondition, "stop")
+	}))
+
+	ctx := grpc.NewContextWithServerTransportStream(context.Background(),
+		&methodTransportStream{method: "/test.Echo/Echo"})
+	got := srv.TransparentHandler()(nil, &errRecvStream{
+		ctx:     ctx,
+		recvErr: fmt.Errorf("clean end: %w", io.EOF),
+	})
+
+	if !mwRan {
+		t.Fatalf("middleware chain did not run: wrapped io.EOF misread as read error (got %v)", got)
+	}
+	if st, ok := status.FromError(got); !ok || st.Code() != codes.FailedPrecondition {
+		t.Errorf("handler error: want FailedPrecondition got %v", got)
 	}
 }
 

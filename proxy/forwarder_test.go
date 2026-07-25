@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -765,4 +767,77 @@ func startEmptyStreamBackend(t *testing.T) string {
 	go server.Serve(lis)
 	t.Cleanup(func() { server.Stop() })
 	return lis.Addr().String()
+}
+
+// eofClientStream is a grpc.ClientStream whose RecvMsg always fails with
+// recvErr, used to drive forwardBackendToClient's empty-stream branch with an
+// error a real backend stream never produces.
+type eofClientStream struct {
+	header  metadata.MD
+	recvErr error
+}
+
+func (s *eofClientStream) Header() (metadata.MD, error) { return s.header, nil }
+func (s *eofClientStream) Trailer() metadata.MD         { return nil }
+func (s *eofClientStream) CloseSend() error             { return nil }
+func (s *eofClientStream) Context() context.Context     { return context.Background() }
+func (s *eofClientStream) SendMsg(any) error            { return nil }
+func (s *eofClientStream) RecvMsg(any) error            { return s.recvErr }
+
+// recvErrServerStream is a grpc.ServerStream that fails RecvMsg with recvErr
+// and records the headers forwarded to it.
+type recvErrServerStream struct {
+	recvErr    error
+	sentHeader metadata.MD
+}
+
+func (s *recvErrServerStream) SetHeader(metadata.MD) error { return nil }
+func (s *recvErrServerStream) SendHeader(md metadata.MD) error {
+	s.sentHeader = md
+	return nil
+}
+func (s *recvErrServerStream) SetTrailer(metadata.MD)   {}
+func (s *recvErrServerStream) Context() context.Context { return context.Background() }
+func (s *recvErrServerStream) SendMsg(any) error        { return nil }
+func (s *recvErrServerStream) RecvMsg(any) error        { return s.recvErr }
+
+// TestForwardBackendToClient_WrappedEOFForwardsHeaders pins that a backend
+// read error wrapping io.EOF still counts as an empty stream, so response
+// headers reach the client. A bare `err == io.EOF` check drops them.
+func TestForwardBackendToClient_WrappedEOFForwardsHeaders(t *testing.T) {
+	f := NewForwarder(nil, nil, nil)
+	defer f.Close()
+
+	src := &eofClientStream{
+		header:  metadata.Pairs("x-empty-stream", "true"),
+		recvErr: fmt.Errorf("clean end: %w", io.EOF),
+	}
+	dst := &recvErrServerStream{}
+
+	if err := <-f.forwardBackendToClient(src, dst); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected wrapped io.EOF, got %v", err)
+	}
+	if vals := dst.sentHeader.Get("x-empty-stream"); len(vals) == 0 || vals[0] != "true" {
+		t.Errorf("expected header x-empty-stream=true forwarded, got %v", dst.sentHeader)
+	}
+}
+
+// TestForwarder_WrappedEOFFromClient pins that a client read error wrapping
+// io.EOF ends the request stream normally instead of aborting the RPC.
+func TestForwarder_WrappedEOFFromClient(t *testing.T) {
+	backendAddr := startEmptyStreamBackend(t)
+
+	f := NewForwarder(nil, nil, nil)
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream := &recvErrServerStream{recvErr: fmt.Errorf("clean end: %w", io.EOF)}
+	// The backend method is not client-streaming, so it needs the one request
+	// message the proxy already read; the client's stream then ends.
+	firstFrame := &Frame{data: []byte("x")}
+	if err := f.Forward(ctx, "/test.Echo/ServerStream", stream, backendAddr, nil, firstFrame); err != nil {
+		t.Fatalf("expected clean completion, got %v", err)
+	}
 }

@@ -18,6 +18,11 @@ type ConnectionCache struct {
 	keepalive      *keepalive.ClientParameters
 	transportCreds credentials.TransportCredentials
 	dialOpts       []grpc.DialOption
+	// maxRecvMsgSize / maxSendMsgSize bound backend call message sizes.
+	// Zero leaves gRPC's own defaults in place; NewServer sets them from
+	// Config.MaxRecvMsgSize / Config.MaxSendMsgSize.
+	maxRecvMsgSize int
+	maxSendMsgSize int
 }
 
 // NewConnectionCache creates an empty connection cache.
@@ -54,8 +59,16 @@ func (c *ConnectionCache) Get(backend string) (*grpc.ClientConn, error) {
 		return conn, nil
 	}
 
+	callOpts := []grpc.CallOption{grpc.ForceCodec(&ProxyCodec{})}
+	if c.maxRecvMsgSize > 0 {
+		callOpts = append(callOpts, grpc.MaxCallRecvMsgSize(c.maxRecvMsgSize))
+	}
+	if c.maxSendMsgSize > 0 {
+		callOpts = append(callOpts, grpc.MaxCallSendMsgSize(c.maxSendMsgSize))
+	}
+
 	opts := []grpc.DialOption{
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(callOpts...),
 	}
 	if c.transportCreds != nil {
 		opts = append(opts, grpc.WithTransportCredentials(c.transportCreds))

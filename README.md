@@ -30,29 +30,6 @@ go get github.com/c32lab/gRPCat
 
 ## Quick Start
 
-### CLI Tool
-
-```bash
-# Start proxy
-grpcat -backend localhost:50051 -listen :8080 -v
-
-# With routing
-grpcat -backend localhost:50051 \
-  -route "user.Service=localhost:50052" \
-  -route "order.Service=localhost:50053" \
-  -v
-```
-
-CLI flags:
-
-| Flag        | Description                                                 |
-|-------------|-------------------------------------------------------------|
-| `-backend`  | Default backend gRPC address (e.g. `localhost:50051`)       |
-| `-listen`   | Listen address (default `:8080`)                            |
-| `-route`    | Per-service route `service=backend`, repeatable             |
-| `-v`        | Verbose logging                                             |
-| `-version`  | Print version and exit                                      |
-
 ### Library Usage
 
 ```go
@@ -106,6 +83,9 @@ cfg := &proxy.Config{
     KeepaliveParams:       &keepalive.ClientParameters{Time: 5 * time.Minute},
     BackendTransportCreds: credentials.NewTLS(tlsConfig), // nil = insecure
     BackendDialOptions:    []grpc.DialOption{grpc.WithStatsHandler(h)},
+    ServerOptions:         []grpc.ServerOption{grpc.Creds(credentials.NewTLS(serverTLSConfig))},
+    MaxRecvMsgSize:        16 << 20, // 0 = no limit
+    MaxSendMsgSize:        16 << 20, // 0 = no limit
     Hooks: &proxy.Hooks{
         OnFirstFrameError: func(req *middleware.RequestInfo, err error) error {
             return status.Errorf(codes.InvalidArgument, "bad frame: %v", err)
@@ -117,7 +97,36 @@ cfg := &proxy.Config{
 - `KeepaliveParams` - Client keepalive for backend connections (nil = gRPC defaults).
 - `BackendTransportCreds` - Transport credentials for backends (nil = insecure).
 - `BackendDialOptions` - Additional dial options (stream interceptors, stats handlers, etc.). Unary interceptors have no effect because all RPCs are proxied as streams.
-- `Hooks.OnFirstFrameError` - Called when the first client frame can't be parsed as a gRPC message. Return non-nil to abort with that error; return nil to let the request proceed with `RequestInfo.FirstPayload == nil`.
+- `ServerOptions` - Additional server options for the listening side (TLS credentials to terminate TLS at the proxy, keepalive enforcement, max concurrent streams, stats handlers, etc.). Appended after the proxy's own options, so they win on conflict. Unary interceptors have no effect because all RPCs are handled as streams.
+- `MaxRecvMsgSize` / `MaxSendMsgSize` - Message size limits in bytes, applied to both legs: the client-facing server side and the backend connections. **Zero means no limit** — this replaces grpc-go's 4 MB receive default, so an unset config forwards messages of any size. Set them explicitly on a public-facing deployment: an unbounded proxy buffers whatever a peer sends, which is a DoS surface.
+  - A size option supplied through `ServerOptions` (listening side) or `BackendDialOptions` (backend side) is applied after these and therefore overrides them on that leg.
+- `Hooks.OnFirstFrameError` - Called when the first client frame can't be read from the stream (transport error, cancellation, or an oversized message). Return non-nil to abort with that error; return nil to abort with the underlying read error. Either way gRPC has already sent the read status to the client, so the returned error only sets the server-side result. It is not called for well-formed requests — gRPC strips the message header before the codec runs, so there is no framing left for the proxy to get wrong.
+
+### Example: standalone proxy
+
+`examples/proxy` is a runnable demonstration — a small `main` that wires the
+library up with the logging and routing middlewares from `examples/middlewares`.
+It is an example, not a shipped binary: it exposes only `DefaultBackend` out of
+the config surface above.
+
+```bash
+# Start proxy
+go run ./examples/proxy -backend localhost:50051 -listen :8080 -v
+
+# With routing
+go run ./examples/proxy -backend localhost:50051 \
+  -route "user.Service=localhost:50052" \
+  -route "order.Service=localhost:50053" \
+  -v
+```
+
+| Flag        | Description                                                 |
+|-------------|-------------------------------------------------------------|
+| `-backend`  | Default backend gRPC address (e.g. `localhost:50051`)       |
+| `-listen`   | Listen address (default `:8080`)                            |
+| `-route`    | Per-service route `service=backend`, repeatable             |
+| `-v`        | Verbose logging                                             |
+| `-version`  | Print version and exit                                      |
 
 ## Writing Middleware
 
@@ -136,9 +145,12 @@ Inspecting the first request payload without a `.proto` file:
 ```go
 func (m *AuthMiddleware) Handle(ctx *middleware.Context) {
     // RequestInfo.FirstPayload is the unframed protobuf body of the first
-    // client message — already copied off gRPC's transport buffer, safe to
-    // hold. Use proto.Unmarshal into your own message type if you have one,
-    // or treat it as opaque bytes for routing/auth.
+    // client message — copied off gRPC's transport buffer, so it is safe to
+    // hold and read. It is NOT safe to write in place: it is the same buffer
+    // forwarded to the backend, so mutating it changes the request the
+    // backend receives. Copy it first if you need to modify it. Use
+    // proto.Unmarshal into your own message type if you have one, or treat
+    // it as opaque bytes for routing/auth.
     if !looksAuthorized(ctx.Request.FirstPayload) {
         ctx.AbortWithError(codes.PermissionDenied, "not allowed")
         return
@@ -170,7 +182,7 @@ client-streaming and bidirectional RPCs, subsequent messages are forwarded
 without passing through middleware. Don't rely on middleware for per-message
 inspection of streaming RPCs — use a backend-side interceptor for that.
 
-**See `cmd/grpcat/middlewares/` for complete examples.**
+**See `examples/middlewares/` for complete examples.**
 
 ## How It Works
 
