@@ -24,7 +24,7 @@ func startLargeEchoBackend(t *testing.T) string {
 	}
 
 	srv := grpc.NewServer(
-		grpc.ForceServerCodec(&ProxyCodec{}),
+		grpc.ForceServerCodecV2(&ProxyCodec{}),
 		grpc.MaxRecvMsgSize(math.MaxInt32),
 		grpc.MaxSendMsgSize(math.MaxInt32),
 	)
@@ -61,7 +61,7 @@ func startFixedSizeBackend(t *testing.T, respSize int) string {
 	}
 
 	srv := grpc.NewServer(
-		grpc.ForceServerCodec(&ProxyCodec{}),
+		grpc.ForceServerCodecV2(&ProxyCodec{}),
 		grpc.MaxRecvMsgSize(math.MaxInt32),
 		grpc.MaxSendMsgSize(math.MaxInt32),
 	)
@@ -75,7 +75,7 @@ func startFixedSizeBackend(t *testing.T, respSize int) string {
 					if err := dec(&Frame{}); err != nil {
 						return nil, err
 					}
-					return &Frame{data: make([]byte, respSize)}, nil
+					return frameFromBytes(make([]byte, respSize)), nil
 				},
 			},
 		},
@@ -110,7 +110,7 @@ func startSizedProxy(t *testing.T, backend string, maxRecv, maxSend int) *grpc.C
 	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.ForceCodec(&ProxyCodec{}),
+			grpc.ForceCodecV2(&ProxyCodec{}),
 			grpc.MaxCallRecvMsgSize(math.MaxInt32),
 			grpc.MaxCallSendMsgSize(math.MaxInt32),
 		),
@@ -141,14 +141,15 @@ func TestProxy_LargeMessageRoundTrip(t *testing.T) {
 	}
 
 	resp := &Frame{}
-	if err := conn.Invoke(ctx, "/test.Echo/Echo", &Frame{data: payload}, resp); err != nil {
+	if err := conn.Invoke(ctx, "/test.Echo/Echo", frameFromBytes(payload), resp); err != nil {
 		t.Fatalf("invoke with %d-byte payload: %v", payloadSize, err)
 	}
 
-	if len(resp.data) != payloadSize {
-		t.Fatalf("response size: want %d got %d", payloadSize, len(resp.data))
+	got := resp.Data()
+	if len(got) != payloadSize {
+		t.Fatalf("response size: want %d got %d", payloadSize, len(got))
 	}
-	if resp.data[0] != payload[0] || resp.data[payloadSize-1] != payload[payloadSize-1] {
+	if got[0] != payload[0] || got[payloadSize-1] != payload[payloadSize-1] {
 		t.Error("response payload does not match request")
 	}
 }
@@ -161,7 +162,7 @@ func TestProxy_MaxRecvMsgSizeRejects(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := conn.Invoke(ctx, "/test.Echo/Echo", &Frame{data: make([]byte, 4096)}, &Frame{})
+	err := conn.Invoke(ctx, "/test.Echo/Echo", frameFromBytes(make([]byte, 4096)), &Frame{})
 	if err == nil {
 		t.Fatal("expected the 4096-byte request to be rejected, got nil")
 	}
@@ -180,7 +181,7 @@ func TestProxy_MaxSendMsgSizeRejects(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := conn.Invoke(ctx, "/test.Echo/Echo", &Frame{data: make([]byte, 4096)}, &Frame{})
+	err := conn.Invoke(ctx, "/test.Echo/Echo", frameFromBytes(make([]byte, 4096)), &Frame{})
 	if err == nil {
 		t.Fatal("expected the 4096-byte request to be rejected, got nil")
 	}
@@ -198,7 +199,7 @@ func TestProxy_MaxSendMsgSizeRejectsResponse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := conn.Invoke(ctx, "/test.Echo/Echo", &Frame{data: []byte("x")}, &Frame{})
+	err := conn.Invoke(ctx, "/test.Echo/Echo", frameFromBytes([]byte("x")), &Frame{})
 	if err == nil {
 		t.Fatal("expected the 4096-byte response to be rejected, got nil")
 	}
@@ -238,7 +239,7 @@ func TestServer_BackendDialOptionsWinOnConflict(t *testing.T) {
 	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.ForceCodec(&ProxyCodec{}),
+			grpc.ForceCodecV2(&ProxyCodec{}),
 			grpc.MaxCallRecvMsgSize(math.MaxInt32),
 		),
 	)
@@ -251,11 +252,11 @@ func TestServer_BackendDialOptionsWinOnConflict(t *testing.T) {
 	defer cancel()
 
 	resp := &Frame{}
-	if err := conn.Invoke(ctx, "/test.Echo/Echo", &Frame{data: []byte("x")}, resp); err != nil {
+	if err := conn.Invoke(ctx, "/test.Echo/Echo", frameFromBytes([]byte("x")), resp); err != nil {
 		t.Fatalf("invoke: %v", err)
 	}
-	if len(resp.data) != 4096 {
-		t.Errorf("response size: want 4096 got %d", len(resp.data))
+	if len(resp.Data()) != 4096 {
+		t.Errorf("response size: want 4096 got %d", len(resp.Data()))
 	}
 }
 
@@ -313,10 +314,10 @@ func TestConnectionCache_UnsetSizesStillCarryTraffic(t *testing.T) {
 	defer cancel()
 
 	resp := &Frame{}
-	if err := conn.Invoke(ctx, "/test.Echo/Echo", &Frame{data: []byte("hi")}, resp); err != nil {
+	if err := conn.Invoke(ctx, "/test.Echo/Echo", frameFromBytes([]byte("hi")), resp); err != nil {
 		t.Fatalf("invoke through an unset-size cache: %v", err)
 	}
-	if string(resp.data) != "hi" {
-		t.Errorf("echo payload: want %q got %q", "hi", resp.data)
+	if string(resp.Data()) != "hi" {
+		t.Errorf("echo payload: want %q got %q", "hi", resp.Data())
 	}
 }

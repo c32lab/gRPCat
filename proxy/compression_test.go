@@ -94,7 +94,7 @@ func startEchoBackendWithStats(t *testing.T, rec *payloadRecorder, sendCompresso
 		t.Fatalf("failed to listen: %v", err)
 	}
 
-	server := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}), grpc.StatsHandler(rec))
+	server := grpc.NewServer(grpc.ForceServerCodecV2(&ProxyCodec{}), grpc.StatsHandler(rec))
 	server.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.Echo",
 		HandlerType: (*any)(nil),
@@ -132,7 +132,7 @@ func echoThroughProxy(t *testing.T, proxyAddr string, useCompressor string) *pay
 	rec := &payloadRecorder{}
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 		grpc.WithStatsHandler(rec),
 	}
 	if useCompressor != "" {
@@ -149,12 +149,12 @@ func echoThroughProxy(t *testing.T, proxyAddr string, useCompressor string) *pay
 	defer cancel()
 
 	body := []byte(strings.Repeat("a", 2000))
-	reqFrame := &Frame{data: buildGRPCMessage(body)}
+	reqFrame := frameFromBytes(buildGRPCMessage(body))
 	respFrame := &Frame{}
 	if err := conn.Invoke(ctx, "/test.Echo/Echo", reqFrame, respFrame); err != nil {
 		t.Fatalf("invoke failed: %v", err)
 	}
-	if got := extractPayload(respFrame.data); string(got) != string(body) {
+	if got := extractPayload(respFrame.Data()); string(got) != string(body) {
 		t.Fatalf("response payload mismatch: got %d bytes, want %d", len(got), len(body))
 	}
 	return rec

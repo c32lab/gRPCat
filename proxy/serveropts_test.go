@@ -48,7 +48,7 @@ func TestServer_ServerOptionsTLS(t *testing.T) {
 
 	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: certPool})),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -60,19 +60,19 @@ func TestServer_ServerOptionsTLS(t *testing.T) {
 
 	respFrame := &Frame{}
 	if err := conn.Invoke(ctx, "/test.Echo/Echo",
-		&Frame{data: buildGRPCMessage([]byte("over-tls"))},
+		frameFromBytes(buildGRPCMessage([]byte("over-tls"))),
 		respFrame,
 	); err != nil {
 		t.Fatalf("invoke over TLS: %v", err)
 	}
-	if got := string(extractPayload(respFrame.data)); got != "over-tls" {
+	if got := string(extractPayload(respFrame.Data())); got != "over-tls" {
 		t.Errorf("expected 'over-tls', got %q", got)
 	}
 
 	// A plaintext client must not be able to talk to the same listener.
 	plain, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial plaintext: %v", err)
@@ -82,7 +82,7 @@ func TestServer_ServerOptionsTLS(t *testing.T) {
 	plainCtx, plainCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer plainCancel()
 	if err := plain.Invoke(plainCtx, "/test.Echo/Echo",
-		&Frame{data: buildGRPCMessage([]byte("plaintext"))},
+		frameFromBytes(buildGRPCMessage([]byte("plaintext"))),
 		&Frame{},
 	); err == nil {
 		t.Error("expected plaintext call to a TLS listener to fail")
@@ -116,7 +116,7 @@ func TestServer_ServerOptionsWinOnConflict(t *testing.T) {
 
 	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -128,13 +128,13 @@ func TestServer_ServerOptionsWinOnConflict(t *testing.T) {
 
 	respFrame := &Frame{}
 	if err := conn.Invoke(ctx, "/test.Echo/Echo",
-		&Frame{data: make([]byte, 4096)},
+		frameFromBytes(make([]byte, 4096)),
 		respFrame,
 	); err != nil {
 		t.Fatalf("invoke with a 4096-byte request: %v", err)
 	}
-	if len(respFrame.data) != 8 {
-		t.Errorf("response size: want 8 got %d", len(respFrame.data))
+	if len(respFrame.Data()) != 8 {
+		t.Errorf("response size: want 8 got %d", len(respFrame.Data()))
 	}
 }
 
@@ -168,7 +168,7 @@ func TestServer_ServerOptionsEmpty(t *testing.T) {
 
 			conn, err := grpc.NewClient(lis.Addr().String(),
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+				grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 			)
 			if err != nil {
 				t.Fatalf("dial: %v", err)
@@ -180,12 +180,12 @@ func TestServer_ServerOptionsEmpty(t *testing.T) {
 
 			respFrame := &Frame{}
 			if err := conn.Invoke(ctx, "/test.Echo/Echo",
-				&Frame{data: buildGRPCMessage([]byte("plain"))},
+				frameFromBytes(buildGRPCMessage([]byte("plain"))),
 				respFrame,
 			); err != nil {
 				t.Fatalf("invoke: %v", err)
 			}
-			if got := string(extractPayload(respFrame.data)); got != "plain" {
+			if got := string(extractPayload(respFrame.Data())); got != "plain" {
 				t.Errorf("expected 'plain', got %q", got)
 			}
 		})

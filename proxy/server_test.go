@@ -80,7 +80,7 @@ func TestServer_StopClosesBackendConnections(t *testing.T) {
 
 	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -91,7 +91,7 @@ func TestServer_StopClosesBackendConnections(t *testing.T) {
 	defer cancel()
 	if err := conn.Invoke(ctx,
 		"/test.Echo/Echo",
-		&Frame{data: buildGRPCMessage([]byte("hi"))},
+		frameFromBytes(buildGRPCMessage([]byte("hi"))),
 		&Frame{},
 	); err != nil {
 		t.Fatalf("invoke: %v", err)
@@ -348,7 +348,7 @@ func TestServer_ConcurrentUse(t *testing.T) {
 
 	cc, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -378,7 +378,7 @@ func TestServer_ConcurrentUse(t *testing.T) {
 			for j := 0; j < 20; j++ {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				_ = cc.Invoke(ctx, "/test.Echo/Echo",
-					&Frame{data: buildGRPCMessage([]byte("c"))},
+					frameFromBytes(buildGRPCMessage([]byte("c"))),
 					&Frame{},
 				)
 				cancel()

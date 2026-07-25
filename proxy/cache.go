@@ -122,7 +122,7 @@ func (c *ConnectionCache) getEntry(backend string) (*cachedConn, error) {
 		return entry, nil
 	}
 
-	callOpts := []grpc.CallOption{grpc.ForceCodec(&ProxyCodec{})}
+	callOpts := []grpc.CallOption{grpc.ForceCodecV2(&ProxyCodec{})}
 	if c.maxRecvMsgSize > 0 {
 		callOpts = append(callOpts, grpc.MaxCallRecvMsgSize(c.maxRecvMsgSize))
 	}

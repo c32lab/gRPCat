@@ -136,7 +136,7 @@ func NewServer(config *Config) (*Server, error) {
 	server.forwarder.cache.startSweeper()
 
 	serverOpts := []grpc.ServerOption{
-		grpc.ForceServerCodec(&ProxyCodec{}),
+		grpc.ForceServerCodecV2(&ProxyCodec{}),
 		grpc.UnknownServiceHandler(server.TransparentHandler()),
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.MaxSendMsgSize(maxSendMsgSize),
@@ -245,19 +245,18 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 		firstFrame := &Frame{}
 		firstFrameErr := serverStream.RecvMsg(firstFrame)
 
-		// gRPC's codec path (ProxyCodec.Unmarshal) hands us the transport's
-		// internal buffer; it is only valid until the next RecvMsg. We keep
-		// this frame alive past middleware execution and pass it through to
-		// Forward, so copy it up front. See proxy/codec.go:73.
-		if firstFrameErr == nil && len(firstFrame.data) > 0 {
-			buf := make([]byte, len(firstFrame.data))
-			copy(buf, firstFrame.data)
-			firstFrame.data = buf
-		}
+		// The frame now owns a reference to the transport's buffers and keeps
+		// them alive past RecvMsg, which is what lets it be forwarded without
+		// a copy. Forward only borrows it, so this handler releases it - and
+		// only once the whole request is done, because the write to the
+		// backend may still be draining. See proxy/codec.go.
+		defer firstFrame.Free()
 
 		// gRPC strips the 5-byte message header before invoking the codec
 		// (rpc_util.go recv -> recvAndDecompress), so the frame already holds
-		// the bare payload. It was copied above, so middleware may keep it.
+		// the bare payload. Frame.Data returns a private copy, which is what
+		// RequestInfo.FirstPayload promises: middleware may read and hold it
+		// after the frame's pooled buffers have gone back to gRPC.
 		var firstPayload []byte
 		if firstFrameErr == nil {
 			firstPayload = firstFrame.Data()
@@ -331,7 +330,7 @@ func handleAborted(serverStream grpc.ServerStream, mwCtx *middleware.Context) er
 	// gRPC prepends the 5-byte message header itself (rpc_util.go msgHeader),
 	// so the frame must carry the bare payload.
 	if mwCtx.Response.Data != nil {
-		mockFrame := &Frame{data: mwCtx.Response.Data}
+		mockFrame := frameFromBytes(mwCtx.Response.Data)
 		if err := serverStream.SendMsg(mockFrame); err != nil {
 			return status.Errorf(codes.Internal, "failed to send response: %v", err)
 		}

@@ -28,10 +28,11 @@ type RequestInfo struct {
 	//     inspect them without additional machinery.
 	// May be nil if the client closed the stream without sending a message.
 	//
-	// The slice is the same buffer the proxy forwards to the backend. It is
-	// safe to read, to proto.Unmarshal, and to hold past the middleware
-	// chain, but NOT to write: mutating it changes the bytes the backend
-	// receives. Copy it first if you need to modify it.
+	// The slice is a private copy of the message, not the buffers the proxy
+	// forwards: it is safe to read, to proto.Unmarshal, and to hold past the
+	// middleware chain, and it stays valid after the proxy has released the
+	// message. Writing to it is harmless but pointless - it does not change
+	// the bytes the backend receives.
 	FirstPayload []byte
 }
 

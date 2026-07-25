@@ -268,15 +268,15 @@ func openEchoStream(t *testing.T, ctx context.Context, conn *grpc.ClientConn) gr
 
 // echoRoundTrip sends one payload and checks that it comes back unchanged.
 func echoRoundTrip(stream grpc.ClientStream, payload string) error {
-	if err := stream.SendMsg(&Frame{data: []byte(payload)}); err != nil {
+	if err := stream.SendMsg(frameFromBytes([]byte(payload))); err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
 	out := &Frame{}
 	if err := stream.RecvMsg(out); err != nil {
 		return fmt.Errorf("recv: %w", err)
 	}
-	if string(out.data) != payload {
-		return fmt.Errorf("echo: got %q, want %q", out.data, payload)
+	if string(out.Data()) != payload {
+		return fmt.Errorf("echo: got %q, want %q", out.Data(), payload)
 	}
 	return nil
 }
@@ -305,7 +305,7 @@ func startIdleEchoBackend(t *testing.T, opts ...grpc.ServerOption) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := grpc.NewServer(append([]grpc.ServerOption{grpc.ForceServerCodec(&ProxyCodec{})}, opts...)...)
+	srv := grpc.NewServer(append([]grpc.ServerOption{grpc.ForceServerCodecV2(&ProxyCodec{})}, opts...)...)
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.IdleEcho",
 		HandlerType: (*any)(nil),
@@ -323,9 +323,11 @@ func startIdleEchoBackend(t *testing.T, opts ...grpc.ServerOption) string {
 							}
 							return err
 						}
-						echo := make([]byte, len(in.data))
-						copy(echo, in.data)
-						if err := stream.SendMsg(&Frame{data: echo}); err != nil {
+						// Frame.Data already returns a private copy, so it
+						// stays valid after the frame is freed.
+						echo := in.Data()
+						in.Free()
+						if err := stream.SendMsg(frameFromBytes(echo)); err != nil {
 							return err
 						}
 					}
@@ -435,7 +437,7 @@ func TestServer_ProxiedStreamSurvivesIdleSweepAfterBackendGoAway(t *testing.T) {
 
 	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
@@ -469,14 +471,14 @@ func TestServer_ProxiedStreamSurvivesIdleSweepAfterBackendGoAway(t *testing.T) {
 // proxiedEchoRoundTrip is echoRoundTrip for a stream that runs through the
 // proxy, where payloads travel as complete gRPC message frames.
 func proxiedEchoRoundTrip(stream grpc.ClientStream, payload string) error {
-	if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte(payload))}); err != nil {
+	if err := stream.SendMsg(frameFromBytes(buildGRPCMessage([]byte(payload)))); err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
 	out := &Frame{}
 	if err := stream.RecvMsg(out); err != nil {
 		return fmt.Errorf("recv: %w", err)
 	}
-	if got := string(extractPayload(out.data)); got != payload {
+	if got := string(extractPayload(out.Data())); got != payload {
 		return fmt.Errorf("echo: got %q, want %q", got, payload)
 	}
 	return nil

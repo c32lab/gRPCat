@@ -52,7 +52,8 @@ func TestProxy_StockProtoClient_FirstPayload(t *testing.T) {
 
 	gotPayload := make(chan []byte, 1)
 	srv.Use(middleware.MiddlewareFunc(func(ctx *middleware.Context) {
-		// FirstPayload aliases a buffer owned by the proxy; copy it out.
+		// FirstPayload is already a private copy, but this test outlives the
+		// middleware chain, so snapshot it into the channel's own slice.
 		buf := make([]byte, len(ctx.Request.FirstPayload))
 		copy(buf, ctx.Request.FirstPayload)
 		select {
@@ -111,7 +112,7 @@ func TestFrame_ParseAs_StockProtoClient(t *testing.T) {
 	got := make(chan parsed, 1)
 	srv.Use(middleware.MiddlewareFunc(func(ctx *middleware.Context) {
 		// Same bytes the codec handed the proxy for the first frame.
-		frame := &Frame{data: ctx.Request.FirstPayload}
+		frame := frameFromBytes(ctx.Request.FirstPayload)
 		out := &wrapperspb.StringValue{}
 		err := frame.ParseAs(out)
 		select {

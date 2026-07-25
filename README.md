@@ -145,12 +145,11 @@ Inspecting the first request payload without a `.proto` file:
 ```go
 func (m *AuthMiddleware) Handle(ctx *middleware.Context) {
     // RequestInfo.FirstPayload is the unframed protobuf body of the first
-    // client message — copied off gRPC's transport buffer, so it is safe to
-    // hold and read. It is NOT safe to write in place: it is the same buffer
-    // forwarded to the backend, so mutating it changes the request the
-    // backend receives. Copy it first if you need to modify it. Use
-    // proto.Unmarshal into your own message type if you have one, or treat
-    // it as opaque bytes for routing/auth.
+    // client message — a private copy taken off gRPC's transport buffers,
+    // so it is safe to hold and read for as long as you like. Writing to it
+    // does not change the request the backend receives; the proxy forwards
+    // the original buffers. Use proto.Unmarshal into your own message type
+    // if you have one, or treat it as opaque bytes for routing/auth.
     if !looksAuthorized(ctx.Request.FirstPayload) {
         ctx.AbortWithError(codes.PermissionDenied, "not allowed")
         return

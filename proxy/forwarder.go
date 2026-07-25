@@ -51,7 +51,10 @@ func NewForwarder(ka *keepalive.ClientParameters, creds credentials.TransportCre
 //   - serverStream: incoming stream from client
 //   - backend: backend server address (e.g., "localhost:50051")
 //   - additionalMD: extra metadata to send to backend (can be set by middlewares)
-//   - firstFrame: first message frame already read from client (can be nil)
+//   - firstFrame: first message frame already read from client (can be nil).
+//     It stays owned by the caller: Forward only sends it, which takes gRPC's
+//     own reference on its buffers, so the caller is still responsible for
+//     Free-ing it once Forward returns.
 //
 // Returns an error if proxying fails, or nil on successful completion.
 func (f *Forwarder) Forward(
@@ -212,7 +215,15 @@ func (f *Forwarder) Forward(
 func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.ServerStream) chan error {
 	ret := make(chan error, 1)
 	go func() {
+		// One Frame is reused for the whole stream. It is touched by this
+		// goroutine only, and each message's buffers are released before the
+		// next RecvMsg refills it, so reuse costs nothing in buffer lifetime
+		// and saves an allocation per message.
 		frame := &Frame{}
+		// Releases the message still held when the loop exits on an error
+		// path that runs after a successful RecvMsg (header failure, or a
+		// RecvMsg that reports an error having already unmarshalled).
+		defer frame.Free()
 		for i := 0; ; i++ {
 			if err := src.RecvMsg(frame); err != nil {
 				if errors.Is(err, io.EOF) && i == 0 {
@@ -234,8 +245,17 @@ func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.Serve
 					break
 				}
 			}
-			if err := dst.SendMsg(frame); err != nil {
-				ret <- err
+			// SendMsg has taken its own reference on the buffers by the time
+			// it returns - the transport Refs them before queueing the write -
+			// so dropping ours here is safe even though the write itself is
+			// asynchronous. On failure nothing was queued and this is the last
+			// reference, which returns the buffers to the pool immediately.
+			// The next RecvMsg would release them too, but only whenever the
+			// next message shows up; on an idle stream that can be minutes.
+			sendErr := dst.SendMsg(frame)
+			frame.Free()
+			if sendErr != nil {
+				ret <- sendErr
 				break
 			}
 		}
@@ -254,14 +274,24 @@ func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.Serve
 func (f *Forwarder) forwardClientToBackend(src grpc.ServerStream, dst grpc.ClientStream) chan error {
 	ret := make(chan error, 1)
 	go func() {
+		// See forwardBackendToClient for why one Frame is reused and why
+		// freeing right after SendMsg is safe. The deferred Free also covers
+		// the case where this goroutine outlives Forward: the "return s2cErr"
+		// path deliberately does not drain it, so it may still be parked in
+		// RecvMsg. That wait ends when gRPC cancels the stream context after
+		// the handler returns, and this Free then hands back any buffers the
+		// last RecvMsg had already unmarshalled.
 		frame := &Frame{}
+		defer frame.Free()
 		for {
 			if err := src.RecvMsg(frame); err != nil {
 				ret <- err
 				break
 			}
-			if err := dst.SendMsg(frame); err != nil {
-				ret <- err
+			sendErr := dst.SendMsg(frame)
+			frame.Free()
+			if sendErr != nil {
+				ret <- sendErr
 				break
 			}
 		}

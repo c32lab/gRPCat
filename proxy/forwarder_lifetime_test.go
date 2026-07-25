@@ -153,7 +153,11 @@ func (s *lifetimeServerStream) RecvMsg(m any) error {
 		time.Sleep(s.recvDelay)
 	}
 	if s.recvFrame != nil {
-		m.(*Frame).data = s.recvFrame
+		// Mimic ProxyCodec.Unmarshal: release whatever the frame held, then
+		// hand it the new payload.
+		f := m.(*Frame)
+		f.Free()
+		*f = *frameFromBytes(s.recvFrame)
 		s.recvFrame = nil
 		return nil
 	}
@@ -195,7 +199,7 @@ func TestForward_ClientErrorWaitsForBackendToClientGoroutine(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		err := f.Forward(ctx, "/test.Echo/ServerStream", ss, backendAddr, nil,
-			&Frame{data: buildGRPCMessage([]byte("go"))})
+			frameFromBytes(buildGRPCMessage([]byte("go"))))
 		ss.markReturned()
 		errCh <- err
 	}()
@@ -266,7 +270,7 @@ func TestForward_ClientErrorDoesNotWaitWhileClientIsConnected(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- f.Forward(ctx, "/test.Echo/ServerStream", ss, backendAddr, nil,
-			&Frame{data: buildGRPCMessage([]byte("go"))})
+			frameFromBytes(buildGRPCMessage([]byte("go"))))
 	}()
 
 	select {
@@ -352,7 +356,7 @@ func TestForward_ClientErrorAfterBackendEOFDoesNotWait(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- f.Forward(ctx, "/test.Echo/ServerStream", ss, backendAddr, nil,
-			&Frame{data: buildGRPCMessage([]byte("go"))})
+			frameFromBytes(buildGRPCMessage([]byte("go"))))
 	}()
 
 	select {
@@ -375,7 +379,7 @@ func TestForwarder_ClientDisconnectMidStream(t *testing.T) {
 
 	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -388,7 +392,7 @@ func TestForwarder_ClientDisconnectMidStream(t *testing.T) {
 		streamCancel()
 		t.Fatalf("new stream: %v", err)
 	}
-	if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte("go"))}); err != nil {
+	if err := stream.SendMsg(frameFromBytes(buildGRPCMessage([]byte("go")))); err != nil {
 		streamCancel()
 		t.Fatalf("send: %v", err)
 	}
@@ -408,7 +412,7 @@ func TestForwarder_ClientDisconnectMidStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new stream after disconnect: %v", err)
 	}
-	if err := stream2.SendMsg(&Frame{data: buildGRPCMessage([]byte("go"))}); err != nil {
+	if err := stream2.SendMsg(frameFromBytes(buildGRPCMessage([]byte("go")))); err != nil {
 		t.Fatalf("send after disconnect: %v", err)
 	}
 	if err := stream2.RecvMsg(&Frame{}); err != nil {
@@ -426,7 +430,7 @@ func TestForwarder_BackendErrorWhileClientSends(t *testing.T) {
 
 	conn, err := grpc.NewClient(proxyAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&ProxyCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(&ProxyCodec{})),
 	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -449,7 +453,7 @@ func TestForwarder_BackendErrorWhileClientSends(t *testing.T) {
 	go func() {
 		defer close(sendDone)
 		for i := 0; i < 1000; i++ {
-			if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte("x"))}); err != nil {
+			if err := stream.SendMsg(frameFromBytes(buildGRPCMessage([]byte("x")))); err != nil {
 				return
 			}
 			time.Sleep(time.Millisecond)
@@ -477,7 +481,7 @@ func TestForwarder_BackendErrorWhileClientSends(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new stream after backend error: %v", err)
 	}
-	if err := stream2.SendMsg(&Frame{data: buildGRPCMessage([]byte("x"))}); err != nil {
+	if err := stream2.SendMsg(frameFromBytes(buildGRPCMessage([]byte("x")))); err != nil {
 		t.Fatalf("send after backend error: %v", err)
 	}
 	if err := stream2.RecvMsg(&Frame{}); err != nil {
@@ -497,7 +501,7 @@ func startImmediateErrorStreamBackend(t *testing.T, code codes.Code, msg string)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv := grpc.NewServer(grpc.ForceServerCodecV2(&ProxyCodec{}))
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.Echo",
 		HandlerType: (*any)(nil),
@@ -525,7 +529,7 @@ func startPushStreamBackend(t *testing.T, msgCount int) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv := grpc.NewServer(grpc.ForceServerCodecV2(&ProxyCodec{}))
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.Echo",
 		HandlerType: (*any)(nil),
@@ -539,7 +543,7 @@ func startPushStreamBackend(t *testing.T, msgCount int) string {
 						return err
 					}
 					for i := 0; i < msgCount; i++ {
-						if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte("tick"))}); err != nil {
+						if err := stream.SendMsg(frameFromBytes(buildGRPCMessage([]byte("tick")))); err != nil {
 							return err
 						}
 					}
@@ -561,7 +565,7 @@ func startHeaderOnlyStreamBackend(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv := grpc.NewServer(grpc.ForceServerCodecV2(&ProxyCodec{}))
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.Echo",
 		HandlerType: (*any)(nil),
@@ -592,7 +596,7 @@ func startInfiniteStreamBackend(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv := grpc.NewServer(grpc.ForceServerCodecV2(&ProxyCodec{}))
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.Echo",
 		HandlerType: (*any)(nil),
@@ -606,7 +610,7 @@ func startInfiniteStreamBackend(t *testing.T) string {
 						return err
 					}
 					for {
-						if err := stream.SendMsg(&Frame{data: buildGRPCMessage([]byte("tick"))}); err != nil {
+						if err := stream.SendMsg(frameFromBytes(buildGRPCMessage([]byte("tick")))); err != nil {
 							return err
 						}
 						select {
@@ -632,7 +636,7 @@ func startFailAfterOneBidiBackend(t *testing.T, code codes.Code, msg string) str
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := grpc.NewServer(grpc.ForceServerCodec(&ProxyCodec{}))
+	srv := grpc.NewServer(grpc.ForceServerCodecV2(&ProxyCodec{}))
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.Echo",
 		HandlerType: (*any)(nil),
@@ -649,7 +653,7 @@ func startFailAfterOneBidiBackend(t *testing.T, code codes.Code, msg string) str
 						}
 						return err
 					}
-					if err := stream.SendMsg(&Frame{data: buildGRPCMessage(extractPayload(in.data))}); err != nil {
+					if err := stream.SendMsg(frameFromBytes(buildGRPCMessage(extractPayload(in.Data())))); err != nil {
 						return err
 					}
 					return status.Error(code, msg)
