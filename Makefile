@@ -1,8 +1,16 @@
-.PHONY: example test help
+.PHONY: build clean test help
 
-# Run the example proxy (see examples/proxy)
-example:
-	@go run ./examples/proxy $(ARGS)
+# Build the grpcat binary
+build:
+	@echo "Building grpcat..."
+	@go build -o grpcat ./cmd/grpcat
+	@echo "Build complete: ./grpcat"
+
+# Clean build artifacts
+clean:
+	@echo "Cleaning..."
+	@rm -f grpcat
+	@echo "Clean complete"
 
 # Run tests. Mirrors CI, which runs with -race.
 test:
@@ -14,6 +22,7 @@ help:
 	@echo "gRPCat - Customizable gRPC Proxy"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make example ARGS='-backend localhost:50051 -v'  - Run the example proxy"
-	@echo "  make test                                        - Run tests with -race"
-	@echo "  make help                                        - Show this help message"
+	@echo "  make build   - Build grpcat binary"
+	@echo "  make clean   - Remove build artifacts"
+	@echo "  make test    - Run tests with -race"
+	@echo "  make help    - Show this help message"

@@ -24,11 +24,59 @@ A lightweight, high-performance gRPC proxy with gin-style middleware support.
 
 ## Installation
 
+As a library:
+
 ```bash
 go get github.com/c32lab/gRPCat
 ```
 
+As a CLI:
+
+```bash
+go install github.com/c32lab/gRPCat/cmd/grpcat@latest
+```
+
 ## Quick Start
+
+### CLI Tool
+
+```bash
+# Start proxy
+grpcat -backend localhost:50051 -listen :8080 -v
+
+# With routing
+grpcat -backend localhost:50051 \
+  -route "user.Service=localhost:50052" \
+  -route "order.Service=localhost:50053" \
+  -v
+
+# Terminate TLS at the proxy, dial the backend over TLS, cap messages at 16MB
+grpcat -backend backend.internal:50051 \
+  -tls-cert server.pem -tls-key server-key.pem \
+  -backend-tls -backend-ca ca.pem \
+  -max-recv-size 16777216 \
+  -backend-idle-timeout 5m
+```
+
+CLI flags:
+
+| Flag                     | Description                                                      |
+|--------------------------|------------------------------------------------------------------|
+| `-backend`               | Default backend gRPC address (e.g. `localhost:50051`)            |
+| `-listen`                | Listen address (default `:8080`)                                 |
+| `-route`                 | Per-service route `service=backend`, repeatable                  |
+| `-v`                     | Verbose logging                                                  |
+| `-version`               | Print version and exit                                           |
+| `-tls-cert` / `-tls-key` | PEM cert and key for serving TLS; must be given together         |
+| `-backend-tls`           | Dial backends over TLS                                           |
+| `-backend-ca`            | PEM CA bundle for verifying backends (implies TLS; system roots if unset) |
+| `-max-recv-size`         | Max received message size in bytes (0 = unlimited)               |
+| `-max-send-size`         | Max sent message size in bytes (0 = unlimited)                   |
+| `-backend-idle-timeout`  | Evict pooled backend connections idle this long (0 = never)      |
+
+The CLI covers the options that reduce to flags. `KeepaliveParams`,
+`BackendDialOptions` and `Hooks` are library-only — use gRPCat as a package for
+those.
 
 ### Library Usage
 
@@ -102,32 +150,6 @@ cfg := &proxy.Config{
   - A size option supplied through `ServerOptions` (listening side) or `BackendDialOptions` (backend side) is applied after these and therefore overrides them on that leg.
 - `Hooks.OnFirstFrameError` - Called when the first client frame can't be read from the stream (transport error, cancellation, or an oversized message). Return non-nil to abort with that error; return nil to abort with the underlying read error. Either way gRPC has already sent the read status to the client, so the returned error only sets the server-side result. It is not called for well-formed requests — gRPC strips the message header before the codec runs, so there is no framing left for the proxy to get wrong.
 
-### Example: standalone proxy
-
-`examples/proxy` is a runnable demonstration — a small `main` that wires the
-library up with the logging and routing middlewares from `examples/middlewares`.
-It is an example, not a shipped binary: it exposes only `DefaultBackend` out of
-the config surface above.
-
-```bash
-# Start proxy
-go run ./examples/proxy -backend localhost:50051 -listen :8080 -v
-
-# With routing
-go run ./examples/proxy -backend localhost:50051 \
-  -route "user.Service=localhost:50052" \
-  -route "order.Service=localhost:50053" \
-  -v
-```
-
-| Flag        | Description                                                 |
-|-------------|-------------------------------------------------------------|
-| `-backend`  | Default backend gRPC address (e.g. `localhost:50051`)       |
-| `-listen`   | Listen address (default `:8080`)                            |
-| `-route`    | Per-service route `service=backend`, repeatable             |
-| `-v`        | Verbose logging                                             |
-| `-version`  | Print version and exit                                      |
-
 ## Writing Middleware
 
 ```go
@@ -181,7 +203,7 @@ client-streaming and bidirectional RPCs, subsequent messages are forwarded
 without passing through middleware. Don't rely on middleware for per-message
 inspection of streaming RPCs — use a backend-side interceptor for that.
 
-**See `examples/middlewares/` for complete examples.**
+**See `cmd/grpcat/middlewares/` for complete examples.**
 
 ## How It Works
 
@@ -213,7 +235,7 @@ forwards is the *uncompressed* frame. Concretely:
   compressed requests are rejected with
   `Unimplemented: grpc: Decompressor is not installed for grpc-encoding "gzip"`.
   Register it by importing the encoding package for its side effect, e.g.
-  `import _ "google.golang.org/grpc/encoding/gzip"` (as `examples/proxy` does).
+  `import _ "google.golang.org/grpc/encoding/gzip"` (as `cmd/grpcat` does).
 - **The proxy → backend leg is always uncompressed**, whatever the client sent.
   Bandwidth between proxy and backend is higher than the client asked for.
 - **Responses to the client are compressed with the encoding the *client*

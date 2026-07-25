@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -10,8 +11,10 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/c32lab/gRPCat/examples/middlewares"
+	"github.com/c32lab/gRPCat/cmd/grpcat/middlewares"
 	"github.com/c32lab/gRPCat/proxy"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	// gRPC decompresses requests at the proxy, so this process must have the
 	// client's compressor registered or compressed requests are rejected with
@@ -51,6 +54,17 @@ var (
 	routes  routeFlags
 	verbose = flag.Bool("v", false, "Enable verbose logging")
 	version = flag.Bool("version", false, "Show version information")
+
+	tlsCert = flag.String("tls-cert", "", "PEM certificate for serving TLS (requires -tls-key)")
+	tlsKey  = flag.String("tls-key", "", "PEM private key for serving TLS (requires -tls-cert)")
+
+	backendTLS = flag.Bool("backend-tls", false, "Dial backends over TLS")
+	backendCA  = flag.String("backend-ca", "", "PEM CA bundle for verifying backends (implies -backend-tls; system roots if unset)")
+
+	maxRecvSize = flag.Int("max-recv-size", 0, "Max received message size in bytes (0 = unlimited)")
+	maxSendSize = flag.Int("max-send-size", 0, "Max sent message size in bytes (0 = unlimited)")
+
+	backendIdleTimeout = flag.Duration("backend-idle-timeout", 0, "Evict pooled backend connections idle this long (0 = never)")
 )
 
 func init() {
@@ -69,6 +83,47 @@ func parseRoute(r string) (service, backend string, err error) {
 	return strings.TrimSpace(service), strings.TrimSpace(backend), nil
 }
 
+// buildProxyConfig assembles a proxy.Config from the parsed flags, loading any
+// certificates the TLS flags refer to.
+func buildProxyConfig() (*proxy.Config, error) {
+	cfg := &proxy.Config{
+		DefaultBackend:     *backend,
+		MaxRecvMsgSize:     *maxRecvSize,
+		MaxSendMsgSize:     *maxSendSize,
+		BackendIdleTimeout: *backendIdleTimeout,
+	}
+
+	if (*tlsCert == "") != (*tlsKey == "") {
+		return nil, fmt.Errorf("-tls-cert and -tls-key must be given together")
+	}
+	if *tlsCert != "" {
+		creds, err := credentials.NewServerTLSFromFile(*tlsCert, *tlsKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load serving certificate: %w", err)
+		}
+		cfg.ServerOptions = []grpc.ServerOption{grpc.Creds(creds)}
+	}
+
+	// -backend-ca on its own is a typo, not a request for plaintext: fail
+	// rather than silently ignoring the CA and dialing insecurely.
+	if *backendCA != "" && !*backendTLS {
+		return nil, fmt.Errorf("-backend-ca requires -backend-tls")
+	}
+	if *backendTLS {
+		if *backendCA != "" {
+			creds, err := credentials.NewClientTLSFromFile(*backendCA, "")
+			if err != nil {
+				return nil, fmt.Errorf("failed to load backend CA: %w", err)
+			}
+			cfg.BackendTransportCreds = creds
+		} else {
+			cfg.BackendTransportCreds = credentials.NewTLS(&tls.Config{})
+		}
+	}
+
+	return cfg, nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -83,8 +138,9 @@ func main() {
 		log.Fatal("Error: -backend flag is required\n\nUsage: grpcat -backend <address> [-listen <address>] [-route service=backend] [-v]\n\nExample:\n  grpcat -backend localhost:50051 -listen :8080 -v\n  grpcat -backend localhost:50051 -route \"user.Service=localhost:50052\" -route \"order.Service=localhost:50053\" -v")
 	}
 
-	config := &proxy.Config{
-		DefaultBackend: *backend,
+	config, err := buildProxyConfig()
+	if err != nil {
+		log.Fatalf("Error: %v", err)
 	}
 
 	server, err := proxy.NewServer(config)
@@ -124,6 +180,14 @@ func main() {
 	log.Printf("Starting gRPCat proxy")
 	log.Printf("Listening on: %s", *listen)
 	log.Printf("Backend: %s", *backend)
+	// Whether TLS actually engaged is worth stating plainly — silently serving
+	// plaintext because a flag was mistyped is the failure worth catching here.
+	if *tlsCert != "" {
+		log.Printf("Serving TLS: enabled")
+	}
+	if *backendTLS {
+		log.Printf("Backend TLS: enabled")
+	}
 	if *verbose {
 		log.Printf("Verbose logging: enabled")
 	}

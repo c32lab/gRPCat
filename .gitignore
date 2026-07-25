@@ -8,8 +8,11 @@
 *.so
 *.dylib
 
-# Project binaries
+# Project binaries. Both entries are anchored on purpose: an unanchored
+# "grpcat" matches the cmd/grpcat/ DIRECTORY at any depth and silently
+# excludes every file in that package.
 /grpcat
+/cmd/grpcat/grpcat
 
 
 # Test binary, built with `go test -c`
