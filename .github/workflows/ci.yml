@@ -38,3 +38,9 @@ jobs:
 
       - name: go test -race
         run: go test -race ./...
+
+      # Exits 3 only when a vulnerable symbol is actually reachable from our
+      # code, so an unfixable CVE deep in the graph will not redden unrelated
+      # PRs. Unreachable ones are Dependabot's job, not this gate's.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

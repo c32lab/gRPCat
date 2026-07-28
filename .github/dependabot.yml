@@ -1,0 +1,29 @@
+version: 2
+
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Version updates cover only explicitly declared dependencies by default.
+    # Every vulnerability that reached this module through x/net, x/text and
+    # x/sys sat behind an `// indirect` line, so the default would have watched
+    # nothing but grpc and protobuf.
+    allow:
+      - dependency-type: "all"
+    # Majors deliberately fall outside the group: they arrive as isolated PRs so
+    # one that fails CI cannot hold the routine bumps hostage.
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

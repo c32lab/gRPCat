@@ -1,0 +1,25 @@
+name: Dependabot auto-merge
+
+on: pull_request
+
+# Workflows that Dependabot triggers are treated as if they came from a fork:
+# the GITHUB_TOKEN is read-only and Actions secrets are unavailable. This block
+# is what raises it back to something that can queue a merge.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    steps:
+      # --auto queues the merge rather than performing it; branch protection
+      # holds the PR until the `test` check passes. Without a required check on
+      # master this would merge on the spot, which is why the two must stay
+      # together.
+      - name: Enable auto-merge
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
