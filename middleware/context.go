@@ -15,8 +15,14 @@ const (
 
 // RequestInfo contains information about the incoming gRPC request
 type RequestInfo struct {
-	Service  string
-	Method   string
+	Service string
+	Method  string
+	// Metadata is the metadata the backend will receive. It starts as a
+	// copy of the client's request metadata, and edits made by middleware
+	// (Set, Delete, Append, or Context.AddMetadata) take effect on the
+	// forwarded request, gin-style. Left untouched, the backend gets exactly
+	// what the client sent. It is never nil on a Context obtained from
+	// NewContext or AcquireContext.
 	Metadata metadata.MD
 	// FirstPayload is the decoded protobuf payload of the FIRST client
 	// message on the stream. It is populated for routing/inspection by
@@ -43,12 +49,15 @@ type ResponseInfo struct {
 	Msg  string
 }
 
-// Context is passed through the middleware chain
+// Context is passed through the middleware chain.
+//
+// The proxy pools Contexts: one is recycled as soon as its RPC completes, so
+// middleware must not keep a reference to it or to its Request past that
+// point, including from goroutines it starts.
 type Context struct {
 	Request  *RequestInfo
 	Response *ResponseInfo
 	Backend  string
-	Metadata metadata.MD
 
 	// Shared data between middlewares (protected by mu)
 	mu     sync.RWMutex
@@ -59,15 +68,29 @@ type Context struct {
 	middlewares []Middleware
 }
 
-// NewContext creates a new middleware context
+// NewContext creates a new middleware context. req may be nil; the returned
+// Context always has a non-nil Request with a non-nil Metadata map, so
+// middleware can call Set or Append on it without checks.
 func NewContext(req *RequestInfo, middlewares []Middleware) *Context {
 	return &Context{
-		Request:     req,
-		Metadata:    metadata.MD{},
+		Request:     normalizeRequest(req),
 		values:      make(map[string]any),
 		middlewares: middlewares,
 		index:       -1,
 	}
+}
+
+// normalizeRequest gives every Context a Request whose Metadata map can be
+// written to: metadata.MD.Set and Append panic on a nil map, and callers
+// building a RequestInfo by hand (tests, library users) rarely set one.
+func normalizeRequest(req *RequestInfo) *RequestInfo {
+	if req == nil {
+		req = &RequestInfo{}
+	}
+	if req.Metadata == nil {
+		req.Metadata = metadata.MD{}
+	}
+	return req
 }
 
 // Set stores a value in the context (thread-safe)
@@ -162,12 +185,14 @@ func (c *Context) SetBackend(backend string) {
 	c.Backend = backend
 }
 
-// AddMetadata adds metadata to be sent to backend
+// AddMetadata appends a metadata entry to the backend request; shorthand for
+// c.Request.Metadata.Append. Use Set or Delete on Request.Metadata directly
+// to replace or drop an entry.
 func (c *Context) AddMetadata(key, value string) {
-	if c.Metadata == nil {
-		c.Metadata = metadata.MD{}
+	if c.Request.Metadata == nil {
+		c.Request.Metadata = metadata.MD{}
 	}
-	c.Metadata.Append(key, value)
+	c.Request.Metadata.Append(key, value)
 }
 
 // reset clears the context for reuse via the pool. Unexported because pool
@@ -176,7 +201,6 @@ func (c *Context) reset() {
 	c.Request = nil
 	c.Response = nil
 	c.Backend = ""
-	c.Metadata = nil
 	c.values = nil
 	c.index = -1
 	c.middlewares = nil

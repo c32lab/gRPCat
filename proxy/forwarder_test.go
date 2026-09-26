@@ -559,7 +559,7 @@ func startBidiEchoBackend(t *testing.T) string {
 
 // TestForwarder_MetadataNotDoubled verifies that metadata keys are forwarded
 // exactly once to the backend, not doubled by the Join(incoming, incoming)
-// bug that existed when mwCtx.Metadata aliased the incoming MD.
+// bug that existed when the middleware's added metadata aliased the incoming MD.
 func TestForwarder_MetadataNotDoubled(t *testing.T) {
 	receivedMD := make(chan metadata.MD, 1)
 	backendAddr := startMetadataCapturingBackend(t, receivedMD)
@@ -814,8 +814,12 @@ func TestForwardBackendToClient_WrappedEOFForwardsHeaders(t *testing.T) {
 	}
 	dst := &recvErrServerStream{}
 
-	if err := <-f.forwardBackendToClient(src, dst); !errors.Is(err, io.EOF) {
-		t.Fatalf("expected wrapped io.EOF, got %v", err)
+	res := <-f.forwardBackendToClient(src, dst)
+	if !errors.Is(res.err, io.EOF) {
+		t.Fatalf("expected wrapped io.EOF, got %v", res.err)
+	}
+	if !res.backendDone {
+		t.Fatal("a RecvMsg error means the backend stream is done")
 	}
 	if vals := dst.sentHeader.Get("x-empty-stream"); len(vals) == 0 || vals[0] != "true" {
 		t.Errorf("expected header x-empty-stream=true forwarded, got %v", dst.sentHeader)

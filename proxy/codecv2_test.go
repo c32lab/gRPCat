@@ -183,18 +183,42 @@ func TestProxyCodec_UnmarshalReleasesPreviousMessage(t *testing.T) {
 	}
 }
 
-// TestProxyCodec_UnmarshalWrongTypeKeepsFrame checks the error path does not
-// steal a reference it cannot release.
-func TestProxyCodec_UnmarshalWrongTypeKeepsFrame(t *testing.T) {
-	pool := &countingPool{}
+// TestProxyCodec_NonFrameDelegatesToProto pins that values other than *Frame
+// go through grpc's proto codec (what lets health/reflection share the proxy's
+// grpc.Server), and that a failed delegated Unmarshal neither steals nor leaks
+// a reference to the pooled buffer.
+func TestProxyCodec_NonFrameDelegatesToProto(t *testing.T) {
 	codec := &ProxyCodec{}
 
-	slice := pooledSlice(t, pool, bulkPayload(3, 2048))
+	want := wrapperspb.String("hello")
+	raw, err := proto.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := codec.Marshal(want)
+	if err != nil {
+		t.Fatalf("Marshal of a proto message: %v", err)
+	}
+	if got := enc.Materialize(); !bytes.Equal(got, raw) {
+		t.Fatalf("Marshal produced %x, want the proto encoding %x", got, raw)
+	}
+	enc.Free()
+
+	got := &wrapperspb.StringValue{}
+	if err := codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(raw)}, got); err != nil {
+		t.Fatalf("Unmarshal into a proto message: %v", err)
+	}
+	if got.GetValue() != "hello" {
+		t.Fatalf("Unmarshal decoded %q, want hello", got.GetValue())
+	}
+
+	pool := &countingPool{}
+	// A run of continuation bytes is an unterminated varint: never valid protobuf.
+	slice := pooledSlice(t, pool, bytes.Repeat([]byte{0x80}, 2048))
 	if err := codec.Unmarshal(slice, &wrapperspb.BytesValue{}); err == nil {
-		t.Fatal("Unmarshal into a non-Frame should fail")
+		t.Fatal("Unmarshal of invalid protobuf should fail")
 	}
 	slice.Free()
-
 	if got := pool.puts(); got != 1 {
 		t.Fatalf("a failed Unmarshal must not retain the buffer, pool puts %d (want 1)", got)
 	}

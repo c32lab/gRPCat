@@ -233,6 +233,8 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 	// and uses the context pool for better performance
 	return func(srv any, serverStream grpc.ServerStream) error {
 		ctx := serverStream.Context()
+		// A copy of the client's metadata. Middleware may edit it, and it is
+		// what the backend receives.
 		md, _ := metadata.FromIncomingContext(ctx)
 
 		// Extract gRPC method name (e.g., "/helloworld.Greeter/SayHello")
@@ -320,7 +322,7 @@ func (s *Server) TransparentHandler() grpc.StreamHandler {
 			fullMethodName,
 			serverStream,
 			backend,
-			mwCtx.Metadata,
+			requestInfo.Metadata,
 			frameToForward,
 		)
 	}

@@ -190,11 +190,17 @@ func (m *AuthMiddleware) Handle(ctx *middleware.Context) {
 
 **Routing & metadata**
 - `ctx.SetBackend(addr)` - Override `Config.DefaultBackend` for this request.
-- `ctx.AddMetadata(key, value)` - Add metadata to the backend request.
+- `ctx.AddMetadata(key, value)` - Append metadata to the backend request; shorthand for `ctx.Request.Metadata.Append`.
 
 **State**
 - `ctx.Set(key, value)` / `ctx.Get(key)` - Share data between middlewares (`any` value, thread-safe).
-- `ctx.Request` - `Service`, `Method`, `Metadata`, `FirstPayload` (see streaming caveat below).
+- `ctx.Request` - `Service`, `Method`, `Metadata`, `FirstPayload` (see streaming caveat below). `Metadata` is what the backend will receive, initially a copy of the client's; `Set`, `Delete` and `Append` on it take effect, gin-style:
+
+```go
+ctx.Request.Metadata.Set("authorization", "Bearer "+svcToken) // replace
+ctx.Request.Metadata.Delete("x-internal-debug")               // drop
+ctx.AddMetadata("x-routed-by", "grpcat")                      // append
+```
 
 ### Streaming caveat
 
@@ -202,6 +208,12 @@ func (m *AuthMiddleware) Handle(ctx *middleware.Context) {
 client-streaming and bidirectional RPCs, subsequent messages are forwarded
 without passing through middleware. Don't rely on middleware for per-message
 inspection of streaming RPCs — use a backend-side interceptor for that.
+
+The proxy reads that first client message *before* it dials the backend, so
+that middleware can route on it. A bidirectional stream on which the backend
+is expected to speak first therefore does not reach the backend until the
+client sends something; a client that only listens waits until its deadline.
+This is inherent to first-frame routing.
 
 **See `cmd/grpcat/middlewares/` for complete examples.**
 

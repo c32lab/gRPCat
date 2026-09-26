@@ -4,6 +4,8 @@ package proxy
 import (
 	"fmt"
 
+	"google.golang.org/grpc/encoding"
+	encproto "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/protobuf/proto"
 )
@@ -99,7 +101,17 @@ func (f *Frame) ProtoMessage() {}
 // implements encoding.CodecV2 rather than the legacy encoding.Codec precisely
 // so that gRPC does not materialize every message into a fresh []byte on the
 // way in (see codecV0Bridge in grpc's codec.go).
+//
+// grpc.ForceServerCodecV2 makes it the codec for every service on the proxy's
+// grpc.Server, including proto-based ones registered through GetGRPCServer
+// (health, reflection, user handlers). Anything that is not a *Frame is
+// therefore handed to grpc's own protobuf codec.
 type ProxyCodec struct{}
+
+// protoCodec is the codec a stock grpc-go server would use.
+func protoCodec() encoding.CodecV2 {
+	return encoding.GetCodecV2(encproto.Name)
+}
 
 // Marshal hands the frame's buffers to gRPC.
 // Called by gRPC when sending messages.
@@ -112,7 +124,7 @@ type ProxyCodec struct{}
 func (c *ProxyCodec) Marshal(v any) (mem.BufferSlice, error) {
 	frame, ok := v.(*Frame)
 	if !ok {
-		return nil, fmt.Errorf("gRPCat codec: expected *Frame, got %T", v)
+		return protoCodec().Marshal(v)
 	}
 	frame.data.Ref()
 	return frame.data, nil
@@ -130,7 +142,7 @@ func (c *ProxyCodec) Marshal(v any) (mem.BufferSlice, error) {
 func (c *ProxyCodec) Unmarshal(data mem.BufferSlice, v any) error {
 	frame, ok := v.(*Frame)
 	if !ok {
-		return fmt.Errorf("gRPCat codec: expected *Frame, got %T", v)
+		return protoCodec().Unmarshal(data, v)
 	}
 	frame.Free()
 	data.Ref()
@@ -138,9 +150,14 @@ func (c *ProxyCodec) Unmarshal(data mem.BufferSlice, v any) error {
 	return nil
 }
 
-// Name returns the codec name.
+// Name returns the codec name. It is empty on purpose: when a codec is forced
+// and no content-subtype is set, grpc-go derives the request content-type
+// from the codec's name, and an empty name yields the bare "application/grpc"
+// a stock client sends. A transparent codec has no name of its own to put on
+// the wire. ProxyCodec is never registered with encoding.RegisterCodecV2,
+// which is the one place a non-empty name would be needed.
 func (c *ProxyCodec) Name() string {
-	return "gRPCat"
+	return ""
 }
 
 // String returns the codec description.

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -330,11 +331,14 @@ func TestForward_BackendErrorReturnsWhileClientIsSilent(t *testing.T) {
 	}
 }
 
-// TestForward_ClientErrorAfterBackendEOFDoesNotWait covers the case where the
-// backend direction has already been received (loop iteration 1) before the
-// client direction fails. Its goroutine is long gone and its channel is
-// drained, so waiting for it again would block forever.
-func TestForward_ClientErrorAfterBackendEOFDoesNotWait(t *testing.T) {
+// TestForward_BackendEOFReturnsWithoutWaitingForClient pins that once the
+// backend has completed the RPC, Forward returns at once instead of waiting
+// for the client to half-close: the client is connected and silent here, so
+// waiting would hold its status until it went away. The client-to-backend
+// goroutine is still parked in RecvMsg; as on the backend-error path it only
+// READS the ServerStream and unwinds when grpc-go cancels the stream context
+// after the handler returns.
+func TestForward_BackendEOFReturnsWithoutWaitingForClient(t *testing.T) {
 	// This backend sends a header and returns OK without any message, so the
 	// backend direction completes with io.EOF first.
 	backendAddr := startHeaderOnlyStreamBackend(t)
@@ -342,16 +346,11 @@ func TestForward_ClientErrorAfterBackendEOFDoesNotWait(t *testing.T) {
 	f := NewForwarder(nil, nil, nil)
 	defer f.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// recvGate is nil: the client sends nothing more and never half-closes.
 	ss := newLifetimeServerStream(ctx)
-	ss.recvErr = status.Error(codes.Canceled, "client went away")
-	// Release the client error only after the backend direction's header
-	// write, i.e. after it has finished; the delay gives Forward ample room to
-	// consume the backend result before the client error is delivered.
-	ss.recvGate = ss.firstWrite
-	ss.recvDelay = 500 * time.Millisecond
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -362,11 +361,18 @@ func TestForward_ClientErrorAfterBackendEOFDoesNotWait(t *testing.T) {
 	select {
 	case err := <-errCh:
 		ss.markReturned()
-		if status.Code(err) != codes.Canceled {
-			t.Fatalf("expected the client's Canceled error back, got %v", err)
+		if err != nil {
+			t.Fatalf("expected clean completion, got %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("Forward blocked waiting for a direction that had already completed")
+		t.Fatal("Forward waited for the client to half-close although the backend had completed the RPC")
+	}
+
+	cancel()
+	select {
+	case <-ss.recvExited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("client-to-backend goroutine did not unwind after the stream context was cancelled")
 	}
 }
 
@@ -664,4 +670,90 @@ func startFailAfterOneBidiBackend(t *testing.T, code codes.Code, msg string) str
 	go srv.Serve(lis)
 	t.Cleanup(func() { srv.Stop() })
 	return lis.Addr().String()
+}
+
+// closeSendRecorder wraps the backend stream and counts CloseSend calls.
+type closeSendRecorder struct {
+	grpc.ClientStream
+	closeSends atomic.Int32
+}
+
+func (r *closeSendRecorder) CloseSend() error {
+	r.closeSends.Add(1)
+	return r.ClientStream.CloseSend()
+}
+
+// recordingForwarder returns a Forwarder whose backend streams are wrapped in
+// a closeSendRecorder, handed back through rec after the stream is opened.
+func recordingForwarder(rec **closeSendRecorder) *Forwarder {
+	return NewForwarder(nil, nil, []grpc.DialOption{grpc.WithStreamInterceptor(
+		func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			cs, err := streamer(ctx, desc, cc, method, opts...)
+			if err != nil {
+				return nil, err
+			}
+			*rec = &closeSendRecorder{ClientStream: cs}
+			return *rec, nil
+		})})
+}
+
+// TestForward_NoCloseSendWhileClientStillSending pins that the backend stream
+// is not half-closed on the backend's behalf: when the backend completes while
+// the client has not half-closed, Forward must return without calling
+// CloseSend, because the client-to-backend goroutine may still be inside
+// SendMsg on that stream and grpc-go forbids CloseSend concurrent with SendMsg.
+func TestForward_NoCloseSendWhileClientStillSending(t *testing.T) {
+	backendAddr := startHeaderOnlyStreamBackend(t)
+
+	var rec *closeSendRecorder
+	f := recordingForwarder(&rec)
+	defer f.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// recvGate is nil: the client is connected, silent, and never half-closes.
+	ss := newLifetimeServerStream(ctx)
+
+	if err := f.Forward(ctx, "/test.Echo/ServerStream", ss, backendAddr, nil,
+		frameFromBytes(buildGRPCMessage([]byte("go")))); err != nil {
+		t.Fatalf("expected clean completion, got %v", err)
+	}
+	if n := rec.closeSends.Load(); n != 0 {
+		t.Fatalf("Forward half-closed the backend stream %d time(s) although the client never did; "+
+			"a CloseSend here races the client-to-backend goroutine's SendMsg", n)
+	}
+
+	cancel()
+	select {
+	case <-ss.recvExited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("client-to-backend goroutine did not unwind after the stream context was cancelled")
+	}
+}
+
+// TestForward_CloseSendOnceAfterClientHalfCloses is the positive counterpart:
+// when the client does half-close, the backend stream is half-closed exactly
+// once, after which the backend's completion ends the RPC.
+func TestForward_CloseSendOnceAfterClientHalfCloses(t *testing.T) {
+	backendAddr := startHeaderOnlyStreamBackend(t)
+
+	var rec *closeSendRecorder
+	f := recordingForwarder(&rec)
+	defer f.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gate := make(chan struct{})
+	close(gate)
+	ss := newLifetimeServerStream(ctx)
+	ss.recvGate = gate
+	ss.recvErr = io.EOF // the client half-closes right away
+
+	if err := f.Forward(ctx, "/test.Echo/ServerStream", ss, backendAddr, nil,
+		frameFromBytes(buildGRPCMessage([]byte("go")))); err != nil {
+		t.Fatalf("expected clean completion, got %v", err)
+	}
+	if n := rec.closeSends.Load(); n != 1 {
+		t.Fatalf("CloseSend called %d time(s) after the client half-closed, want exactly 1", n)
+	}
 }

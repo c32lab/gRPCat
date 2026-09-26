@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -50,7 +51,9 @@ func NewForwarder(ka *keepalive.ClientParameters, creds credentials.TransportCre
 //   - fullMethodName: gRPC method name (e.g., "/service.Service/Method")
 //   - serverStream: incoming stream from client
 //   - backend: backend server address (e.g., "localhost:50051")
-//   - additionalMD: extra metadata to send to backend (can be set by middlewares)
+//   - md: metadata to send to the backend, normally the client's incoming
+//     metadata as edited by middleware (middleware.RequestInfo.Metadata);
+//     nil sends none. Forward leaves the map itself untouched.
 //   - firstFrame: first message frame already read from client (can be nil).
 //     It stays owned by the caller: Forward only sends it, which takes gRPC's
 //     own reference on its buffers, so the caller is still responsible for
@@ -62,7 +65,7 @@ func (f *Forwarder) Forward(
 	fullMethodName string,
 	serverStream grpc.ServerStream,
 	backend string,
-	additionalMD metadata.MD,
+	md metadata.MD,
 	firstFrame *Frame,
 ) error {
 	// Get or create connection to backend server. acquire pins it against
@@ -79,87 +82,100 @@ func (f *Forwarder) Forward(
 	clientCtx, clientCancel := context.WithCancel(ctx)
 	defer clientCancel()
 
-	// Prepare metadata for backend request.
-	// Merge incoming metadata with additional metadata from middlewares.
-	if len(additionalMD) > 0 {
-		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			clientCtx = metadata.NewOutgoingContext(clientCtx, metadata.Join(md, additionalMD))
-		} else {
-			clientCtx = metadata.NewOutgoingContext(clientCtx, additionalMD)
+	// The backend leg mirrors the client's content-type. By default grpc-go
+	// derives the subtype from ProxyCodec.Name(), which is empty so that the
+	// default is the bare application/grpc a stock client sends. A client
+	// that did send a subtype (application/grpc+json, say) gets it forwarded,
+	// so the backend decodes the payload as it would have directly.
+	var callOpts []grpc.CallOption
+	if len(md) > 0 {
+		if ct := md.Get("content-type"); len(ct) > 0 {
+			if subtype := contentSubtype(ct[0]); subtype != "" {
+				callOpts = append(callOpts, grpc.CallContentSubtype(subtype))
+			}
 		}
-	} else if md, ok := metadata.FromIncomingContext(ctx); ok {
-		clientCtx = metadata.NewOutgoingContext(clientCtx, md)
+		// The proxy decompresses backend responses itself, so the backend
+		// must only see the proxy's own grpc-accept-encoding, which the
+		// transport adds; the client's list could name a compressor the proxy
+		// has not registered. Copy first: the map belongs to the caller.
+		out := md.Copy()
+		out.Delete("grpc-accept-encoding")
+		clientCtx = metadata.NewOutgoingContext(clientCtx, out)
 	}
 
-	// Create bidirectional stream to backend server
-	clientStream, err := grpc.NewClientStream(clientCtx, clientStreamDesc, conn, fullMethodName)
+	// Create bidirectional stream to backend server. A status error here is
+	// already the right answer for the client: Unavailable when the backend
+	// cannot be reached, DeadlineExceeded/Canceled when the client's own
+	// context ended while connecting.
+	clientStream, err := grpc.NewClientStream(clientCtx, clientStreamDesc, conn, fullMethodName, callOpts...)
 	if err != nil {
+		if _, ok := status.FromError(err); ok {
+			return err
+		}
 		return status.Errorf(codes.Internal, "failed to create client stream: %v", err)
 	}
 
 	// If we already read the first frame (for middleware inspection),
 	// send it to backend before starting bidirectional forwarding.
 	if firstFrame != nil {
-		if err := clientStream.SendMsg(firstFrame); err != nil {
-			// A status error already carries the real code (e.g.
-			// ResourceExhausted when the frame is over MaxSendMsgSize).
-			// Pass it through so the first message fails with the same
-			// code forwardClientToBackend gives every later one.
-			if _, ok := status.FromError(err); ok {
-				return err
-			}
-			return status.Errorf(codes.Internal, "failed to send first frame: %v", err)
+		if err := sendFirstFrame(clientStream, firstFrame); err != nil {
+			return err
 		}
 	}
 
-	// Start two goroutines for bidirectional forwarding.
-	// Each returns when its direction completes or errors.
-	s2cErrChan := f.forwardBackendToClient(clientStream, serverStream)
+	// Start two goroutines for bidirectional forwarding. Each reports exactly
+	// once on its channel.
+	s2cCh := f.forwardBackendToClient(clientStream, serverStream)
 	c2sErrChan := f.forwardClientToBackend(serverStream, clientStream)
 
-	// CRITICAL: We must wait for BOTH goroutines to complete.
-	// The loop runs exactly twice - once for each direction.
+	// The RPC is over when the backend says so: io.EOF from the backend
+	// direction is the backend's OK status, anything else is its failure.
+	// Neither waits for the client direction. Waiting would hold the status
+	// back until the client half-closed - a client that only sends after
+	// reading would never get it - and that goroutine may still be mid-SendMsg
+	// on the backend stream, while grpc-go forbids CloseSend concurrently with
+	// SendMsg. The backend stream is therefore only half-closed once the
+	// client direction has reported io.EOF, i.e. its goroutine has exited.
 	//
-	// We don't know which direction will finish first:
-	//   1. Unary: client sends, then backend responds -> c2s finishes first
-	//   2. Server streaming: client sends once, backend streams -> c2s finishes first
-	//   3. Client streaming: client streams, backend responds once -> s2c finishes first
-	//   4. Bidirectional: both stream concurrently -> either can finish first
-	//
-	// When one direction finishes with io.EOF (normal completion), the other
-	// direction may still be pumping data, so we must continue the loop.
-	//
-	// CloseSend() signals to backend that we won't send more data.
-	// We call it when either direction completes (EOF), ensuring it's called exactly once.
-	var closedSend bool
-	for i := 0; i < 2; i++ {
+	// Cases by RPC shape:
+	//   1. Unary / server streaming: the client half-closes, then the backend
+	//      completes.
+	//   2. Client streaming: the client half-closes, the backend answers.
+	//   3. Bidirectional: either side may finish first, including a backend
+	//      that completes while the client is still sending.
+	for {
 		select {
-		case s2cErr := <-s2cErrChan:
-			if errors.Is(s2cErr, io.EOF) {
-				// Backend finished sending responses.
-				// Close our send side to backend (if not already closed).
-				// Even if c2s is still forwarding, backend completing usually means
-				// it won't accept more data, so we signal completion.
-				if !closedSend {
-					clientStream.CloseSend()
-					closedSend = true
-				}
-			} else {
-				// Error from backend stream. gRPC returns a status.Error here,
-				// carrying the backend's real code/message/details. Forward it
-				// verbatim plus the backend's trailers so the client sees the
-				// exact failure the backend produced.
+		case res := <-s2cCh:
+			if !res.backendDone {
+				// The write to the client failed (it went away or stopped
+				// reading) while the backend stream is still live. Its
+				// trailers are not readable yet - grpc-go only guarantees
+				// Trailer once RecvMsg has failed - and the client would not
+				// see them anyway.
 				clientCancel()
-				serverStream.SetTrailer(clientStream.Trailer())
-				// Deliberately NOT waiting for forwardClientToBackend here:
-				// it is parked in serverStream.RecvMsg, which only unblocks on
-				// client activity or on gRPC cancelling the stream context -
-				// and gRPC does that when this handler returns. Waiting would
-				// deadlock. Returning is safe because that goroutine only
-				// READS serverStream, and once the stream is done its cleanup
-				// (WriteStatus) is a no-op.
-				return s2cErr
+				return res.err
 			}
+			// Copy the backend's trailers to the client; on failure they carry
+			// the details of the status the client is about to see.
+			serverStream.SetTrailer(clientStream.Trailer())
+			if errors.Is(res.err, io.EOF) {
+				// Backend completed the RPC. forwardClientToBackend may still
+				// be running; see the error branch below for why returning
+				// with it in flight is safe.
+				return nil
+			}
+			// gRPC returns a status.Error here, carrying the backend's real
+			// code/message/details. Forward it verbatim so the client sees
+			// the exact failure the backend produced.
+			clientCancel()
+			// Deliberately NOT waiting for forwardClientToBackend here:
+			// it is parked in serverStream.RecvMsg, which only unblocks on
+			// client activity or on gRPC cancelling the stream context -
+			// and gRPC does that when this handler returns. Waiting would
+			// deadlock. Returning is safe because that goroutine only
+			// READS serverStream, and once the stream is done its cleanup
+			// (WriteStatus) is a no-op.
+			return res.err
 		case c2sErr := <-c2sErrChan:
 			if !errors.Is(c2sErr, io.EOF) {
 				// Error reading from client (disconnect, cancellation). Cancel
@@ -181,69 +197,87 @@ func (f *Forwarder) Forward(
 				// still in flight; the surviving window is one SendMsg, which
 				// gRPC rejects with an error once the stream is done rather
 				// than corrupting it.
-				// i == 0 means this direction has not been received yet (each
-				// goroutine sends exactly once).
-				if i == 0 && serverStream.Context().Err() != nil {
-					<-s2cErrChan
+				if serverStream.Context().Err() != nil {
+					<-s2cCh
 				}
 				return c2sErr
 			}
-			// Client finished sending all requests (io.EOF).
-			// Close send side to backend to signal end of request stream.
-			if !closedSend {
-				clientStream.CloseSend()
-				closedSend = true
-			}
+			// Client finished sending all requests. Its goroutine has exited,
+			// so half-closing the backend stream cannot race with a SendMsg.
+			// grpc-go's CloseSend never returns an error.
+			clientStream.CloseSend()
 		}
 	}
-	// Both directions finished successfully (both returned io.EOF).
-	// Copy trailers from backend to client before returning.
-	serverStream.SetTrailer(clientStream.Trailer())
-	return nil
+}
+
+// sendFirstFrame writes the frame the handler already read for middleware.
+//
+// io.EOF is not an error here: it means the backend has already ended the
+// stream, e.g. rejected the RPC at header time without reading the body, and
+// its status is only available from RecvMsg. The caller then starts the pumps
+// and forwardBackendToClient delivers that status, as happens for every later
+// frame. A status error already carries the real code (e.g. ResourceExhausted
+// when the frame is over MaxSendMsgSize) and is passed through so the first
+// message fails with the same code forwardClientToBackend gives later ones.
+func sendFirstFrame(stream grpc.ClientStream, frame *Frame) error {
+	err := stream.SendMsg(frame)
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.Errorf(codes.Internal, "failed to send first frame: %v", err)
+}
+
+// backendReport is what forwardBackendToClient sends when it stops.
+type backendReport struct {
+	err error
+	// backendDone is true when err came from reading the backend stream: the
+	// backend has finished (err is io.EOF or its status) and its trailers may
+	// be read. It is false when a write to the client failed while the backend
+	// stream was still live.
+	backendDone bool
 }
 
 // forwardBackendToClient forwards messages from backend to client.
-// Runs in a separate goroutine and returns a channel that receives the first error or io.EOF.
+// Runs in a separate goroutine and returns a channel that receives one
+// backendReport when the direction stops.
 //
-// IMPORTANT: This uses a loop counter (for i := 0; ; i++) to detect the first message.
-// This is NOT a performance issue - it's required by gRPC protocol:
-//   - Headers can only be read AFTER receiving the first message from backend
-//   - Headers must be sent to client BEFORE forwarding the first message
-//   - This is the only way to properly proxy gRPC headers
+// Response headers are forwarded as soon as the backend sends them: Header
+// blocks until they arrive or the stream ends, so a backend that sends
+// headers and then streams slowly does not leave the client's Header() call
+// waiting for the first message, and headers a backend sent before failing
+// are not lost. A trailers-only response yields no headers and stays
+// trailers-only for the client.
 //
 // The channel is buffered (size 1) to prevent goroutine leak if the caller stops reading.
-func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.ServerStream) chan error {
-	ret := make(chan error, 1)
+func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.ServerStream) chan backendReport {
+	ret := make(chan backendReport, 1)
 	go func() {
+		// grpc-go's Header never reports an error: a stream that ended
+		// without headers (trailers-only) yields nil metadata and its status
+		// surfaces from RecvMsg below, which is also where any other failure
+		// is picked up.
+		if md, err := src.Header(); err == nil && md != nil {
+			if err := dst.SendHeader(md); err != nil {
+				ret <- backendReport{err: err}
+				return
+			}
+		}
 		// One Frame is reused for the whole stream. It is touched by this
 		// goroutine only, and each message's buffers are released before the
 		// next RecvMsg refills it, so reuse costs nothing in buffer lifetime
 		// and saves an allocation per message.
 		frame := &Frame{}
 		// Releases the message still held when the loop exits on an error
-		// path that runs after a successful RecvMsg (header failure, or a
-		// RecvMsg that reports an error having already unmarshalled).
+		// path that runs after a successful RecvMsg (a RecvMsg that reports
+		// an error having already unmarshalled).
 		defer frame.Free()
-		for i := 0; ; i++ {
+		for {
 			if err := src.RecvMsg(frame); err != nil {
-				if errors.Is(err, io.EOF) && i == 0 {
-					if md, hErr := src.Header(); hErr == nil {
-						dst.SendHeader(md)
-					}
-				}
-				ret <- err
-				break
-			}
-			if i == 0 {
-				md, err := src.Header()
-				if err != nil {
-					ret <- err
-					break
-				}
-				if err := dst.SendHeader(md); err != nil {
-					ret <- err
-					break
-				}
+				ret <- backendReport{err: err, backendDone: true}
+				return
 			}
 			// SendMsg has taken its own reference on the buffers by the time
 			// it returns - the transport Refs them before queueing the write -
@@ -255,8 +289,8 @@ func (f *Forwarder) forwardBackendToClient(src grpc.ClientStream, dst grpc.Serve
 			sendErr := dst.SendMsg(frame)
 			frame.Free()
 			if sendErr != nil {
-				ret <- sendErr
-				break
+				ret <- backendReport{err: sendErr}
+				return
 			}
 		}
 	}()
@@ -303,4 +337,15 @@ func (f *Forwarder) forwardClientToBackend(src grpc.ServerStream, dst grpc.Clien
 // Should be called when shutting down the proxy server.
 func (f *Forwarder) Close() {
 	f.cache.Close()
+}
+
+// contentSubtype returns the subtype of a gRPC content-type such as
+// "application/grpc+proto" ("proto"), or "" for a bare "application/grpc" or
+// anything else.
+func contentSubtype(contentType string) string {
+	rest, ok := strings.CutPrefix(contentType, "application/grpc")
+	if !ok || len(rest) < 2 || rest[0] != '+' {
+		return ""
+	}
+	return strings.ToLower(rest[1:])
 }

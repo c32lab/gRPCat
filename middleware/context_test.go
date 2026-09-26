@@ -154,7 +154,10 @@ func TestContext_AddMetadata(t *testing.T) {
 
 	ctx.AddMetadata("new-key", "new-value")
 
-	if vals := ctx.Metadata.Get("new-key"); len(vals) == 0 || vals[0] != "new-value" {
+	if vals := ctx.Request.Metadata.Get("existing"); len(vals) != 1 || vals[0] != "value" {
+		t.Errorf("existing metadata must be kept, got %v", vals)
+	}
+	if vals := ctx.Request.Metadata.Get("new-key"); len(vals) == 0 || vals[0] != "new-value" {
 		t.Errorf("expected new-key=new-value, got %v", vals)
 	}
 }
@@ -203,4 +206,30 @@ func TestContext_SendResponse(t *testing.T) {
 	if ctx.Response.Code != codes.OK {
 		t.Errorf("expected OK, got %v", ctx.Response.Code)
 	}
+}
+
+// TestContext_MetadataWritableFromConstructors pins that a Context from
+// NewContext or AcquireContext always carries a writable Request.Metadata,
+// even when the request was built without metadata or is nil, so the
+// documented Set/Append calls cannot panic.
+func TestContext_MetadataWritableFromConstructors(t *testing.T) {
+	ctx := NewContext(&RequestInfo{Service: "svc", Method: "M"}, nil)
+	ctx.Request.Metadata.Set("authorization", "Bearer x")
+	ctx.Request.Metadata.Append("x-extra", "1")
+	if got := ctx.Request.Metadata.Get("authorization"); len(got) != 1 || got[0] != "Bearer x" {
+		t.Fatalf("Set on a fresh context: got %v", got)
+	}
+
+	ctx = NewContext(nil, nil)
+	ctx.AddMetadata("x-routed-by", "grpcat")
+	if got := ctx.Request.Metadata.Get("x-routed-by"); len(got) != 1 {
+		t.Fatalf("AddMetadata with a nil request: got %v", got)
+	}
+
+	pc := AcquireContext(&RequestInfo{}, nil)
+	pc.Request.Metadata.Set("k", "v")
+	if got := pc.Request.Metadata.Get("k"); len(got) != 1 || got[0] != "v" {
+		t.Fatalf("Set on a pooled context: got %v", got)
+	}
+	ReleaseContext(pc)
 }
