@@ -40,6 +40,9 @@ func TestParseRoute(t *testing.T) {
 		{"simple", "user.Service=localhost:50052", "user.Service", "localhost:50052", false},
 		{"equals in backend", "svc=host:1234?x=y", "svc", "host:1234?x=y", false},
 		{"surrounding spaces", " svc = host:1234 ", "svc", "host:1234", false},
+		{"empty backend", "svc=", "", "", true},
+		{"empty service", "=host:1234", "", "", true},
+		{"blank backend", "svc=   ", "", "", true},
 		{"no separator", "svc", "", "", true},
 		{"empty", "", "", "", true},
 	}

@@ -69,7 +69,7 @@ CLI flags:
 | `-version`               | Print version and exit                                           |
 | `-tls-cert` / `-tls-key` | PEM cert and key for serving TLS; must be given together         |
 | `-backend-tls`           | Dial backends over TLS                                           |
-| `-backend-ca`            | PEM CA bundle for verifying backends (implies TLS; system roots if unset) |
+| `-backend-ca`            | PEM CA bundle for verifying backends (requires `-backend-tls`; system roots if unset) |
 | `-max-recv-size`         | Max received message size in bytes (0 = unlimited)               |
 | `-max-send-size`         | Max sent message size in bytes (0 = unlimited)                   |
 | `-backend-idle-timeout`  | Evict pooled backend connections idle this long (0 = never)      |

@@ -60,7 +60,7 @@ var (
 	tlsKey  = flag.String("tls-key", "", "PEM private key for serving TLS (requires -tls-cert)")
 
 	backendTLS = flag.Bool("backend-tls", false, "Dial backends over TLS")
-	backendCA  = flag.String("backend-ca", "", "PEM CA bundle for verifying backends (implies -backend-tls; system roots if unset)")
+	backendCA  = flag.String("backend-ca", "", "PEM CA bundle for verifying backends (requires -backend-tls; system roots if unset)")
 
 	maxRecvSize = flag.Int("max-recv-size", 0, "Max received message size in bytes (0 = unlimited)")
 	maxSendSize = flag.Int("max-send-size", 0, "Max sent message size in bytes (0 = unlimited)")
@@ -83,13 +83,16 @@ func versionString() string {
 }
 
 // parseRoute splits a -route value into service and backend. It cuts on the
-// first '=' only, so backends containing '=' are preserved.
+// first '=' only, so backends containing '=' are preserved. Either side being
+// empty is rejected: an empty backend would silently fall through to
+// -backend, an empty service could never match.
 func parseRoute(r string) (service, backend string, err error) {
 	service, backend, ok := strings.Cut(r, "=")
-	if !ok {
+	service, backend = strings.TrimSpace(service), strings.TrimSpace(backend)
+	if !ok || service == "" || backend == "" {
 		return "", "", fmt.Errorf("invalid route format: %s (expected: service=backend)", r)
 	}
-	return strings.TrimSpace(service), strings.TrimSpace(backend), nil
+	return service, backend, nil
 }
 
 // buildProxyConfig assembles a proxy.Config from the parsed flags, loading any
@@ -182,8 +185,15 @@ func main() {
 
 	go func() {
 		<-sigChan
-		fmt.Println("\n\nShutting down gracefully...")
+		fmt.Println("\n\nShutting down gracefully... (press Ctrl-C again to force)")
 		cancel()
+		// Graceful shutdown waits for every in-flight RPC, and a long-lived
+		// stream can hold it up indefinitely. A second signal closes the
+		// connections instead, which lets the graceful stop complete and the
+		// process exit.
+		<-sigChan
+		fmt.Println("Forcing shutdown...")
+		server.GetGRPCServer().Stop()
 	}()
 
 	log.Printf("Starting gRPCat proxy")
