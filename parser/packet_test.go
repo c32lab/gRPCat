@@ -32,3 +32,15 @@ func TestParseGRPCMessageFromReader_AtLimit(t *testing.T) {
 		t.Errorf("length: want %d, got %d", len(payload), msg.Length)
 	}
 }
+
+// A length field close to MaxUint32 used to wrap the 5+length bounds check in
+// uint32 arithmetic and panic on the slice expression; it must be an error.
+func TestParseGRPCMessage_LengthOverflow(t *testing.T) {
+	for _, length := range []uint32{0xFFFFFFFB, 0xFFFFFFFC, 0xFFFFFFFF} {
+		var data [5]byte
+		binary.BigEndian.PutUint32(data[1:5], length)
+		if _, err := ParseGRPCMessage(data[:]); err == nil {
+			t.Errorf("length %#x: expected an error for a truncated message", length)
+		}
+	}
+}

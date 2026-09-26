@@ -30,13 +30,16 @@ func ParseGRPCMessage(data []byte) (*GRPCMessage, error) {
 	// Parse message length (4 bytes, big-endian)
 	msg.Length = binary.BigEndian.Uint32(data[1:5])
 
-	// Validate data length
-	if len(data) < int(5+msg.Length) {
-		return nil, fmt.Errorf("incomplete message: expected %d bytes, got %d", 5+msg.Length, len(data))
+	// Validate data length. Computed in 64 bits: in uint32 a length near
+	// MaxUint32 wraps 5+length to a small number, passes this check and
+	// panics on the slice below.
+	end := 5 + uint64(msg.Length)
+	if uint64(len(data)) < end {
+		return nil, fmt.Errorf("incomplete message: expected %d bytes, got %d", end, len(data))
 	}
 
 	// Extract payload
-	msg.Payload = data[5 : 5+msg.Length]
+	msg.Payload = data[5:end]
 
 	return msg, nil
 }
